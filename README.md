@@ -6,7 +6,12 @@ hashbrown
 [![Documentation](https://docs.rs/hashbrown/badge.svg)](https://docs.rs/hashbrown)
 [![Rust](https://img.shields.io/badge/rust-1.63.0%2B-blue.svg?maxAge=3600)](https://github.com/rust-lang/hashbrown)
 
-This crate is a Rust port of Google's high-performance [SwissTable] hash
+Fork of https://github.com/rust-lang/hashbrown with added COW support.
+
+HashMap implementation that will copy the data when-ever it modification is
+made to either the entry list or the value in the map itself.
+
+The original crate was a Rust port of Google's high-performance [SwissTable] hash
 map, adapted to make it a drop-in replacement for Rust's standard `HashMap`
 and `HashSet` types.
 
