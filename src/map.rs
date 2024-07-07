@@ -2187,7 +2187,7 @@ where
 {
     /// Returns a iterator of references over the remaining items.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub(super) fn iter(&self) -> Iter<'_, K, V, A> {
+    pub fn iter(&self) -> Iter<'_, K, V, A> {
         Iter {
             inner: self.inner.clone(),
             marker: PhantomData,
@@ -2232,7 +2232,7 @@ pub struct IntoIter<K, V, A: Allocator + Clone = Global> {
 impl<K, V, A: Allocator + Clone> IntoIter<K, V, A> {
     /// Returns a iterator of references over the remaining items.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub(super) fn iter(&self) -> Iter<'_, K, V, A> {
+    pub fn iter(&self) -> Iter<'_, K, V, A> {
         Iter {
             inner: self.inner.iter(),
             marker: PhantomData,
@@ -2497,7 +2497,7 @@ pub struct Drain<'a, K: Clone, V, A: Allocator + Clone = Global> {
 impl<K: Clone, V, A: Allocator + Clone> Drain<'_, K, V, A> {
     /// Returns a iterator of references over the remaining items.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub(super) fn iter(&self) -> Iter<'_, K, V, A> {
+    pub fn iter(&self) -> Iter<'_, K, V, A> {
         Iter {
             inner: CowRawIter {
                 inner: self.inner.iter(),

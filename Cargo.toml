@@ -1,6 +1,6 @@
 [package]
 name = "cow_hashbrown"
-version = "0.14.8"
+version = "0.14.9"
 authors = ["Amanieu d'Antras <amanieu@gmail.com>", "John Sharratt <johnathan.sharratt@gmail.com>"]
 description = "A Rust port of Google's SwissTable hash map with copy-on-write support"
 license = "MIT OR Apache-2.0"
