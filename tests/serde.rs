@@ -1,8 +1,8 @@
 #![cfg(feature = "serde")]
 
 use core::hash::BuildHasherDefault;
-use fnv::FnvHasher;
 use cow_hashbrown::{CowHashMap, HashSet};
+use fnv::FnvHasher;
 use serde_test::{assert_tokens, Token};
 
 // We use FnvHash for this test because we rely on the ordering

@@ -634,7 +634,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// Returns a reference to the underlying allocator.
     #[inline]
     pub fn allocator(&self) -> A {
-        self.table.map(|t| t.allocator()).clone()
+        self.table.map(|t| t.allocator().clone())
     }
 
     /// Creates an empty `HashMap` which will use the given hash builder to hash
@@ -741,7 +741,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn capacity(&self) -> usize {
-        self.table.map(|t| t.capacity()).inner
+        self.table.map(|t| t.capacity())
     }
 
     /// An iterator visiting all keys in arbitrary order.
@@ -934,7 +934,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     #[cfg(test)]
     #[cfg_attr(feature = "inline-more", inline)]
     fn raw_capacity(&self) -> usize {
-        self.table.map(|t| t.buckets()).inner
+        self.table.map(|t| t.buckets())
     }
 
     /// Returns the number of elements in the map.
@@ -951,7 +951,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn len(&self) -> usize {
-        self.table.map(|t| t.len()).inner
+        self.table.map(|t| t.len())
     }
 
     /// Returns `true` if the map contains no elements.
@@ -1010,10 +1010,14 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// assert!(a.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn drain(&self) -> Drain<'_, K, V, A> {
-        Drain {
-            inner: self.table.rcu(|t| t.drain()),
-        }
+    pub fn drain(&self) -> Iter<'_, K, V, A> {
+        self.table
+            .rcu(|t| {
+                let ret = self.iter();
+                t.clear();
+                ret
+            })
+            .inner
     }
 
     /// Retains only the elements specified by the predicate. Keeps the
@@ -1374,18 +1378,18 @@ where
     /// assert_eq!(letters.get(&'y'), None);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn entry(&self, key: K) -> Entry<'_, '_, K, V, S, A> {
+    pub fn entry(&self, key: K) -> Entry<'_, K, V, S, A> {
         let hash = make_hash::<K, S>(&self.hash_builder, &key);
 
-        let lookup = self.table.map(|t| t.find(hash, equivalent_key(&key)));
-        if let Some(elem) = lookup.inner {
+        let table = self.table.inner.load().clone();
+        let lookup = table.find(hash, equivalent_key(&key));
+        if let Some(elem) = lookup {
             Entry::Occupied(OccupiedEntry {
                 hash,
                 key: Some(key),
                 elem: RawTableGuard {
-                    guard: lookup.guard,
+                    guard: table,
                     inner: elem,
-                    _phantom: PhantomData,
                 },
                 table: self,
             })
@@ -1416,20 +1420,20 @@ where
     /// assert_eq!(words["horseyland"], 1);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn entry_ref<'a, 'b, 'c, Q>(&'a mut self, key: &'b Q) -> EntryRef<'a, 'b, 'c, K, Q, V, S, A>
+    pub fn entry_ref<'a, 'b, 'c, Q>(&'a mut self, key: &'b Q) -> EntryRef<'a, 'b, K, Q, V, S, A>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = make_hash::<Q, S>(&self.hash_builder, key);
-        let lookup = self.table.map(|t| t.find(hash, equivalent_key(key)));
-        if let Some(elem) = lookup.inner {
+        let table = self.table.inner.load().clone();
+        let lookup = table.find(hash, equivalent_key(key));
+        if let Some(elem) = lookup {
             EntryRef::Occupied(OccupiedEntryRef {
                 hash,
                 key: Some(KeyOrRef::Borrowed(key)),
                 elem: RawTableGuard {
-                    guard: lookup.guard,
+                    guard: table,
                     inner: elem,
-                    _phantom: PhantomData,
                 },
                 table: self,
             })
@@ -1466,8 +1470,15 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let inner = self.get_inner(k);
-        inner.inner.map(|(_, v)| v.load_full())
+        self.table.map(|t| {
+            if t.is_empty() {
+                None
+            } else {
+                let hash = make_hash::<Q, S>(&self.hash_builder, k);
+                let r = t.get(hash, equivalent_key(k))?;
+                Some(r.1.load_full())
+            }
+        })
     }
 
     /// Returns the key-value pair corresponding to the supplied key.
@@ -1490,19 +1501,7 @@ where
     /// assert_eq!(map.get_key_value(&2), None);
     /// ```
     #[inline]
-    pub fn get_key_value<Q>(&self, k: &Q) -> Option<(&K, Arc<V>)>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let inner = self.get_inner(k);
-        inner.inner.map(|(k, v)| (k, v.load_full()))
-    }
-
-    #[inline]
-    fn get_inner<Q>(
-        &self,
-        k: &Q,
-    ) -> RawTableGuard<'_, (K, Arc<ArcSwap<V>>), A, Option<&(K, Arc<ArcSwap<V>>)>>
+    pub fn get_key_value<Q>(&self, k: &Q) -> Option<(K, Arc<V>)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -1511,7 +1510,8 @@ where
                 None
             } else {
                 let hash = make_hash::<Q, S>(&self.hash_builder, k);
-                t.get(hash, equivalent_key(k))
+                let r = t.get(hash, equivalent_key(k))?;
+                Some((r.0.clone(), r.1.load_full()))
             }
         })
     }
@@ -1540,12 +1540,19 @@ where
     /// assert_eq!(map.get_key_value_mut(&2), None);
     /// ```
     #[inline]
-    pub fn get_key_value_mut<Q>(&self, k: &Q) -> Option<(&K, CowValueGuard<V>)>
+    pub fn get_key_value_mut<Q>(&self, k: &Q) -> Option<(K, CowValueGuard<V>)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let guard = self.get_inner(k);
-        guard.inner.map(|(k, v)| (k, CowValueGuard::new(v.clone())))
+        self.table.map(|t| {
+            if t.is_empty() {
+                None
+            } else {
+                let hash = make_hash::<Q, S>(&self.hash_builder, k);
+                let r = t.get(hash, equivalent_key(k))?;
+                Some((r.0.clone(), CowValueGuard::new(r.1.clone())))
+            }
+        })
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -1572,7 +1579,14 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.get_inner(k).is_some()
+        self.table.map(|t| {
+            if t.is_empty() {
+                false
+            } else {
+                let hash = make_hash::<Q, S>(&self.hash_builder, k);
+                t.get(hash, equivalent_key(k)).is_some()
+            }
+        })
     }
 
     /// Returns a mutable reference to the value corresponding to the key.
@@ -1603,8 +1617,15 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let guard = self.get_inner(k);
-        guard.inner.map(|(_k, v)| CowValueGuard::new(v.clone()))
+        self.table.map(|t| {
+            if t.is_empty() {
+                None
+            } else {
+                let hash = make_hash::<Q, S>(&self.hash_builder, k);
+                let r = t.get(hash, equivalent_key(k))?;
+                Some(CowValueGuard::new(r.1.clone()))
+            }
+        })
     }
 
     /// Inserts a key-value pair into the map.
@@ -1753,7 +1774,7 @@ where
         &mut self,
         key: K,
         value: V,
-    ) -> Result<CowValueGuard<V>, OccupiedError<'_, '_, K, V, S, A>> {
+    ) -> Result<CowValueGuard<V>, OccupiedError<'_, K, V, S, A>> {
         match self.entry(key) {
             Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
             Entry::Vacant(entry) => Ok(entry.insert(value)),
@@ -2474,7 +2495,7 @@ impl<K: Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for Values<'_,
 /// assert_eq!(drain_iter.next(), None);
 /// ```
 pub struct Drain<'a, K: Clone, V, A: Allocator + Clone = Global> {
-    inner: RawTableGuard<'a, (K, Arc<ArcSwap<V>>), A, RawDrain<'a, (K, Arc<ArcSwap<V>>), A>>,
+    inner: RawTableGuard<(K, Arc<ArcSwap<V>>), A, RawDrain<'a, (K, Arc<ArcSwap<V>>), A>>,
 }
 
 impl<K: Clone, V, A: Allocator + Clone> Drain<'_, K, V, A> {
@@ -2952,7 +2973,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert(self, default_key: K, default_val: V) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
+    pub fn or_insert(self, default_key: K, default_val: V) -> (K, CowValueGuard<V>)
     where
         K: Hash,
         S: BuildHasher,
@@ -2980,7 +3001,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], "hoho".to_string());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with<F>(self, default: F) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
+    pub fn or_insert_with<F>(self, default: F) -> (K, CowValueGuard<V>)
     where
         F: FnOnce() -> (K, V),
         K: Hash,
@@ -3094,6 +3115,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawEntryMut<'a, K, V, S, A> {
     where
         F: Fn(&K, &V) -> Option<V>,
         K: Equivalent<K>,
+        V: Clone,
     {
         match self {
             RawEntryMut::Occupied(entry) => entry.replace_entry_with(f),
@@ -3344,10 +3366,10 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
     /// assert!(Rc::strong_count(&key_one) == 1 && Rc::strong_count(&key_two) == 2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_key_value(self) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>) {
+    pub fn into_key_value(self) -> (K, CowValueGuard<V>) {
         unsafe {
             let &mut (ref mut key, ref mut value) = self.elem.as_mut();
-            (key, value)
+            (key.clone(), CowValueGuard::new(value.clone()))
         }
     }
 
@@ -3499,12 +3521,13 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
     where
         F: Fn(&K, &V) -> Option<V>,
         K: Equivalent<K>,
+        V: Clone,
     {
         let elem = unsafe { self.elem.as_ref() };
         let key = &elem.0;
-        let value = elem.1.load();
+        let value = elem.1.load_full();
         loop {
-            match f(&key, &value) {
+            match f(key, &value) {
                 Some(new) => {
                     let prev = elem.1.compare_and_swap(&value, Arc::new(new));
                     let swapped = ptr_eq(&value, &*prev);
@@ -3548,7 +3571,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawVacantEntryMut<'a, K, V, S, A>
     /// assert_eq!(map[&"c"], 300);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, key: K, value: V) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
+    pub fn insert(self, key: K, value: V) -> (K, CowValueGuard<V>)
     where
         K: Hash,
         S: BuildHasher,
@@ -3594,22 +3617,19 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawVacantEntryMut<'a, K, V, S, A>
         hash: u64,
         key: K,
         value: Arc<ArcSwap<V>>,
-    ) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
+    ) -> (K, CowValueGuard<V>)
     where
         K: Hash,
         S: BuildHasher,
     {
-        let &mut (ref mut k, ref mut v) = self
-            .table
-            .rcu(|t| {
-                t.insert_entry(
-                    hash,
-                    (key.clone(), value.clone()),
-                    make_hasher::<_, Arc<ArcSwap<V>>, S>(self.hash_builder),
-                )
-            })
-            .inner;
-        (k, v)
+        self.table.rcu(|t| {
+            t.insert_entry(
+                hash,
+                (key.clone(), value.clone()),
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(self.hash_builder),
+            );
+        });
+        (key, CowValueGuard::new(value))
     }
 
     /// Set the value of an entry with a custom hasher function.
@@ -3655,16 +3675,17 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawVacantEntryMut<'a, K, V, S, A>
         key: K,
         value: V,
         hasher: H,
-    ) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
+    ) -> (K, CowValueGuard<V>)
     where
         H: Fn(&K) -> u64,
     {
         let value = Arc::new(ArcSwap::new(Arc::new(value)));
-        let &mut (ref mut k, ref mut v) = self
-            .table
-            .rcu(|t| t.insert_entry(hash, (key.clone(), value.clone()), |x| hasher(&x.0)))
-            .inner;
-        (k, v)
+        self.table
+            .rcu(|t| {
+                let r = t.insert_entry(hash, (key.clone(), value.clone()), |x| hasher(&x.0));
+                (r.0.clone(), CowValueGuard::new(r.1.clone()))
+            })
+            .inner
     }
 
     #[cfg_attr(feature = "inline-more", inline)]
@@ -3771,7 +3792,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> Debug for RawVacantEntryMut<'_, K, V,
 /// vec.sort_unstable();
 /// assert_eq!(vec, [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5), ("f", 6)]);
 /// ```
-pub enum Entry<'a, 'b, K: Clone, V, S, A = Global>
+pub enum Entry<'a, K: Clone, V, S, A = Global>
 where
     A: Allocator + Clone,
 {
@@ -3788,7 +3809,7 @@ where
     ///     Entry::Occupied(_) => { }
     /// }
     /// ```
-    Occupied(OccupiedEntry<'a, 'b, K, V, S, A>),
+    Occupied(OccupiedEntry<'a, K, V, S, A>),
 
     /// A vacant entry.
     ///
@@ -3846,15 +3867,14 @@ where
 /// assert_eq!(map.get(&"c"), None);
 /// assert_eq!(map.len(), 2);
 /// ```
-pub struct OccupiedEntry<'a, 'b, K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global>
-{
+pub struct OccupiedEntry<'a, K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     hash: u64,
     key: Option<K>,
-    elem: RawTableGuard<'b, (K, Arc<ArcSwap<V>>), A, Bucket<(K, Arc<ArcSwap<V>>)>>,
+    elem: RawTableGuard<(K, Arc<ArcSwap<V>>), A, Bucket<(K, Arc<ArcSwap<V>>)>>,
     table: &'a CowHashMap<K, V, S, A>,
 }
 
-unsafe impl<K: Clone, V, S, A> Send for OccupiedEntry<'_, '_, K, V, S, A>
+unsafe impl<K: Clone, V, S, A> Send for OccupiedEntry<'_, K, V, S, A>
 where
     K: Send,
     V: Send,
@@ -3862,7 +3882,7 @@ where
     A: Send + Allocator + Clone,
 {
 }
-unsafe impl<K: Clone, V, S, A> Sync for OccupiedEntry<'_, '_, K, V, S, A>
+unsafe impl<K: Clone, V, S, A> Sync for OccupiedEntry<'_, K, V, S, A>
 where
     K: Sync,
     V: Sync,
@@ -3965,7 +3985,7 @@ impl<K: Debug + Clone, V, S, A: Allocator + Clone> Debug for VacantEntry<'_, K, 
 /// }
 /// assert_eq!(map.len(), 6);
 /// ```
-pub enum EntryRef<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A = Global>
+pub enum EntryRef<'a, 'b, K: Clone, Q: ?Sized, V, S, A = Global>
 where
     A: Allocator + Clone,
 {
@@ -3982,7 +4002,7 @@ where
     ///     EntryRef::Occupied(_) => { }
     /// }
     /// ```
-    Occupied(OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>),
+    Occupied(OccupiedEntryRef<'a, 'b, K, Q, V, S, A>),
 
     /// A vacant entry.
     ///
@@ -4000,7 +4020,7 @@ where
     Vacant(VacantEntryRef<'a, 'b, K, Q, V, S, A>),
 }
 
-impl<K: Clone, Q, V, S, A> Debug for EntryRef<'_, '_, '_, K, Q, V, S, A>
+impl<K: Clone, Q, V, S, A> Debug for EntryRef<'_, '_, K, Q, V, S, A>
 where
     K: Borrow<Q>,
     Q: Debug + ?Sized,
@@ -4082,14 +4102,14 @@ impl<'a, K: Borrow<Q>, Q: ?Sized> AsRef<Q> for KeyOrRef<'a, K, Q> {
 /// assert_eq!(map.get("c"), None);
 /// assert_eq!(map.len(), 2);
 /// ```
-pub struct OccupiedEntryRef<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone = Global> {
+pub struct OccupiedEntryRef<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone = Global> {
     hash: u64,
     key: Option<KeyOrRef<'b, K, Q>>,
-    elem: RawTableGuard<'c, (K, Arc<ArcSwap<V>>), A, Bucket<(K, Arc<ArcSwap<V>>)>>,
+    elem: RawTableGuard<(K, Arc<ArcSwap<V>>), A, Bucket<(K, Arc<ArcSwap<V>>)>>,
     table: &'a CowHashMap<K, V, S, A>,
 }
 
-unsafe impl<'a, 'b, 'c, K: Clone, Q, V, S, A> Send for OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
+unsafe impl<'a, 'b, 'c, K: Clone, Q, V, S, A> Send for OccupiedEntryRef<'a, 'b, K, Q, V, S, A>
 where
     K: Send,
     Q: Sync + ?Sized,
@@ -4098,7 +4118,7 @@ where
     A: Send + Allocator + Clone,
 {
 }
-unsafe impl<'a, 'b, 'c, K: Clone, Q, V, S, A> Sync for OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
+unsafe impl<'a, 'b, 'c, K: Clone, Q, V, S, A> Sync for OccupiedEntryRef<'a, 'b, K, Q, V, S, A>
 where
     K: Sync,
     Q: Sync + ?Sized,
@@ -4108,7 +4128,7 @@ where
 {
 }
 
-impl<K: Clone, Q, V, S, A> Debug for OccupiedEntryRef<'_, '_, '_, K, Q, V, S, A>
+impl<K: Clone, Q, V, S, A> Debug for OccupiedEntryRef<'_, '_, K, Q, V, S, A>
 where
     K: Borrow<Q>,
     Q: Debug + ?Sized,
@@ -4194,9 +4214,9 @@ where
 /// }
 /// assert_eq!(map[&"a"], 100);
 /// ```
-pub struct OccupiedError<'a, 'b, K: Clone, V, S, A: Allocator + Clone = Global> {
+pub struct OccupiedError<'a, K: Clone, V, S, A: Allocator + Clone = Global> {
     /// The entry in the map that was already occupied.
-    pub entry: OccupiedEntry<'a, 'b, K, V, S, A>,
+    pub entry: OccupiedEntry<'a, K, V, S, A>,
     /// The value which was not inserted, because the entry was already occupied.
     pub value: V,
 }
@@ -4527,7 +4547,7 @@ where
     }
 }
 
-impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> Entry<'a, 'b, K, V, S, A> {
+impl<'a, K: Clone, V, S, A: Allocator + Clone> Entry<'a, K, V, S, A> {
     /// Sets the value of the entry, and returns an OccupiedEntry.
     ///
     /// # Examples
@@ -4541,13 +4561,10 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> Entry<'a, 'b, K, V, S, A> {
     /// assert_eq!(entry.key(), &"horseyland");
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, value: V) -> OccupiedEntry<'a, 'b, K, V, S, A>
+    pub fn insert(self, value: V) -> OccupiedEntry<'a, K, V, S, A>
     where
         K: Hash,
         S: BuildHasher,
-        K: 'b,
-        V: 'b,
-        A: 'b,
     {
         match self {
             Entry::Occupied(entry) => {
@@ -4784,7 +4801,7 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> Entry<'a, 'b, K, V, S, A> {
     }
 }
 
-impl<'a, 'b, K: Clone, V: Default + Clone, S, A: Allocator + Clone> Entry<'a, 'b, K, V, S, A> {
+impl<'a, K: Clone, V: Default + Clone, S, A: Allocator + Clone> Entry<'a, K, V, S, A> {
     /// Ensures a value is in the entry by inserting the default value if empty,
     /// and returns a mutable reference to the value in the entry.
     ///
@@ -4817,7 +4834,7 @@ impl<'a, 'b, K: Clone, V: Default + Clone, S, A: Allocator + Clone> Entry<'a, 'b
     }
 }
 
-impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, 'b, K, V, S, A> {
+impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, K, V, S, A> {
     /// Gets a reference to the key in the entry.
     ///
     /// # Examples
@@ -5169,14 +5186,14 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, 'b, K, V, S
     /// assert!(!map.contains_key("poneyland"));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn replace_entry_with<F>(self, f: F) -> Entry<'a, 'b, K, V, S, A>
+    pub fn replace_entry_with<F>(self, f: F) -> Entry<'a, K, V, S, A>
     where
         F: Fn(&K, &V) -> Option<V>,
         K: Equivalent<K>,
     {
         let elem = unsafe { self.elem.inner.as_ref() };
         let key = &elem.0;
-        let value = elem.1.load();
+        let value = elem.1.load_full();
         loop {
             match f(&key, &value) {
                 Some(new) => {
@@ -5264,24 +5281,24 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> VacantEntry<'a, K, V, S, A> {
         S: BuildHasher,
     {
         let value = Arc::new(ArcSwap::new(Arc::new(value)));
-        let entry = self.table.table.rcu(|t| {
-            t.insert_entry(
-                self.hash,
-                (self.key.clone(), value.clone()),
-                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
-            )
-        });
-        CowValueGuard::new(entry.1.clone())
+        self.table
+            .table
+            .rcu(|t| {
+                let r = t.insert_entry(
+                    self.hash,
+                    (self.key.clone(), value.clone()),
+                    make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
+                );
+                CowValueGuard::new(r.1.clone())
+            })
+            .inner
     }
 
     #[cfg_attr(feature = "inline-more", inline)]
-    pub(crate) fn insert_entry<'b>(self, value: V) -> OccupiedEntry<'a, 'b, K, V, S, A>
+    pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, S, A>
     where
         K: Hash,
         S: BuildHasher,
-        K: 'b,
-        V: 'b,
-        A: 'b,
     {
         let value = Arc::new(ArcSwap::new(Arc::new(value)));
         let elem = self.table.table.rcu(|t| {
@@ -5300,9 +5317,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> VacantEntry<'a, K, V, S, A> {
     }
 }
 
-impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
-    EntryRef<'a, 'b, 'c, K, Q, V, S, A>
-{
+impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// Sets the value of the entry, and returns an OccupiedEntryRef.
     ///
     /// # Examples
@@ -5316,13 +5331,10 @@ impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
     /// assert_eq!(entry.key(), "horseyland");
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, value: V) -> OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
+    pub fn insert(self, value: V) -> OccupiedEntryRef<'a, 'b, K, Q, V, S, A>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
-        V: 'c,
-        K: 'c,
-        A: 'c,
     {
         match self {
             EntryRef::Occupied(mut entry) => {
@@ -5559,8 +5571,8 @@ impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
     }
 }
 
-impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V: Default + Clone, S, A: Allocator + Clone>
-    EntryRef<'a, 'b, 'c, K, Q, V, S, A>
+impl<'a, 'b, K: Clone, Q: ?Sized, V: Default + Clone, S, A: Allocator + Clone>
+    EntryRef<'a, 'b, K, Q, V, S, A>
 {
     /// Ensures a value is in the entry by inserting the default value if empty,
     /// and returns a mutable reference to the value in the entry.
@@ -5594,8 +5606,8 @@ impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V: Default + Clone, S, A: Allocator + Clon
     }
 }
 
-impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
-    OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
+impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
+    OccupiedEntryRef<'a, 'b, K, Q, V, S, A>
 {
     /// Gets a reference to the key in the entry.
     ///
@@ -5945,14 +5957,14 @@ impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
     /// assert!(!map.contains_key("poneyland"));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn replace_entry_with<F>(self, f: F) -> EntryRef<'a, 'b, 'c, K, Q, V, S, A>
+    pub fn replace_entry_with<F>(self, f: F) -> EntryRef<'a, 'b, K, Q, V, S, A>
     where
         F: Fn(&K, &V) -> Option<V>,
         K: Equivalent<K>,
     {
         let elem = unsafe { self.elem.as_ref() };
         let key = &elem.0;
-        let value = elem.1.load();
+        let value = elem.1.load_full();
         loop {
             match f(&key, &value) {
                 Some(new) => {
@@ -6054,24 +6066,23 @@ impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
         let table = &self.table.table;
         let key = self.key.into_owned();
         let value = Arc::new(ArcSwap::new(Arc::new(value)));
-        let entry = table.rcu(|t| {
-            t.insert_entry(
-                self.hash,
-                (key.clone(), value.clone()),
-                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
-            )
-        });
-        CowValueGuard::new(entry.1.clone())
+        table
+            .rcu(|t| {
+                let r = t.insert_entry(
+                    self.hash,
+                    (key.clone(), value.clone()),
+                    make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
+                );
+                CowValueGuard::new(r.1.clone())
+            })
+            .inner
     }
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn insert_entry<'c>(self, value: V) -> OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
+    fn insert_entry(self, value: V) -> OccupiedEntryRef<'a, 'b, K, Q, V, S, A>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
-        V: 'c,
-        K: 'c,
-        A: 'c,
     {
         let key = self.key.into_owned();
         let value = Arc::new(ArcSwap::new(Arc::new(value)));

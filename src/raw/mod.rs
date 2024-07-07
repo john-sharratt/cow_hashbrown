@@ -805,13 +805,12 @@ impl<T> CowRawTable<T, Global> {
     }
 }
 
-pub(crate) struct RawTableGuard<'a, T, A: Allocator + Clone, R> {
+pub(crate) struct RawTableGuard<T, A: Allocator + Clone, R> {
     pub(crate) guard: Arc<RawTable<T, A>>,
     pub(crate) inner: R,
-    pub(crate) _phantom: PhantomData<&'a ()>,
 }
 
-impl<'a, T, A: Allocator + Clone, R> Deref for RawTableGuard<'_, T, A, R> {
+impl<T, A: Allocator + Clone, R> Deref for RawTableGuard<T, A, R> {
     type Target = R;
 
     fn deref(&self) -> &Self::Target {
@@ -856,37 +855,25 @@ where
         }
     }
 
-    pub fn map<'a, 'b, R, F>(&'a self, f: F) -> RawTableGuard<'b, T, A, R>
+    pub fn map<R, F>(&self, f: F) -> R
     where
-        F: Fn(&'b RawTable<T, A>) -> R,
-        T: 'b,
-        A: 'b,
+        F: Fn(&RawTable<T, A>) -> R,
     {
-        let guard: Arc<RawTable<T, A>> = self.inner.load().clone();
-
-        let guard_ptr: &RawTable<T, A> = guard.deref();
-        let guard_ptr = unsafe { mem::transmute(guard_ptr) };
-        let ret = f(guard_ptr);
-        RawTableGuard {
-            guard,
-            inner: ret,
-            _phantom: PhantomData,
-        }
+        let guard = self.inner.load();
+        f(&guard)
     }
 
-    pub fn rcu<'a, 'b, F, R>(&'a self, mut f: F) -> RawTableGuard<'b, T, A, R>
+    pub fn rcu<F, R>(&self, mut f: F) -> RawTableGuard<T, A, R>
     where
-        F: FnMut(&'b mut RawTable<T, A>) -> R,
-        T: Clone + 'b,
-        A: 'b,
+        F: FnMut(&mut RawTable<T, A>) -> R,
+        T: Clone,
     {
         let mut cur = self.inner.load();
         loop {
             let new = cur.as_ref().clone();
             let mut new = Arc::new(new);
 
-            let new_ptr: &mut RawTable<T, A> = Arc::get_mut(&mut new).unwrap();
-            let new_ptr = unsafe { mem::transmute(new_ptr) };
+            let new_ptr = Arc::get_mut(&mut new).unwrap();
             let ret: R = f(new_ptr);
 
             let prev = self.inner.compare_and_swap(&*cur, new.clone());
@@ -895,7 +882,6 @@ where
                 return RawTableGuard {
                     guard: new,
                     inner: ret,
-                    _phantom: PhantomData,
                 };
             } else {
                 cur = prev;
@@ -1634,7 +1620,7 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     /// Gets a reference to an element in the table.
     #[inline]
-    pub fn get(&self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&T> {
+    pub fn get<'a>(&'a self, hash: u64, eq: impl FnMut(&'_ T) -> bool) -> Option<&'a T> {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.find(hash, eq) {
             Some(bucket) => Some(unsafe { bucket.as_ref() }),
@@ -1645,7 +1631,7 @@ impl<T, A: Allocator> RawTable<T, A> {
     /// Gets a mutable reference to an element in the table.
     #[inline]
     #[allow(dead_code)]
-    pub fn get_mut(&mut self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&mut T> {
+    pub fn get_mut<'a>(&mut self, hash: u64, eq: impl FnMut(&'_ T) -> bool) -> Option<&'a mut T> {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.find(hash, eq) {
             Some(bucket) => Some(unsafe { bucket.as_mut() }),
@@ -1779,6 +1765,7 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     /// Returns an iterator which removes all elements from the table without
     /// freeing the memory.
+    #[allow(dead_code)]
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn drain(&mut self) -> RawDrain<'_, T, A> {
         unsafe {
@@ -1794,6 +1781,7 @@ impl<T, A: Allocator> RawTable<T, A> {
     ///
     /// It is up to the caller to ensure that the iterator is valid for this
     /// `RawTable` and covers all items that remain in the table.
+    #[allow(dead_code)]
     #[cfg_attr(feature = "inline-more", inline)]
     pub unsafe fn drain_iter_from(&mut self, iter: RawIter<T>) -> RawDrain<'_, T, A> {
         debug_assert_eq!(iter.len(), self.len());
