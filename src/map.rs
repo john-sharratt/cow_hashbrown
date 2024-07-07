@@ -2122,9 +2122,7 @@ where
 /// assert_eq!(iter.next(), None);
 /// assert_eq!(iter.next(), None);
 /// ```
-pub struct Iter<'a, K, V, A>
-where
-    A: Allocator + Clone,
+pub struct Iter<'a, K, V, A: Allocator + Clone = Global>
 {
     inner: CowRawIter<(K, Arc<ArcSwap<V>>), A>,
     marker: PhantomData<(&'a K, &'a Arc<ArcSwap<V>>)>,
@@ -2171,9 +2169,7 @@ where
 /// assert_eq!(map.get(&1).unwrap(), &Arc::new("One Mississippi".to_owned()));
 /// assert_eq!(map.get(&2).unwrap(), &Arc::new("Two Mississippi".to_owned()));
 /// ```
-pub struct IterMut<'a, K, V, A>
-where
-    A: Allocator + Clone,
+pub struct IterMut<'a, K, V, A: Allocator + Clone = Global>
 {
     inner: CowRawIter<(K, Arc<ArcSwap<V>>), A>,
     // To ensure invariance with respect to V
@@ -2397,7 +2393,7 @@ impl<K: Clone, V, A: Allocator + Clone> FusedIterator for IntoValues<K, V, A> {}
 /// assert_eq!(keys.next(), None);
 /// assert_eq!(keys.next(), None);
 /// ```
-pub struct Keys<'a, K: Clone, V, A: Allocator + Clone> {
+pub struct Keys<'a, K: Clone, V, A: Allocator + Clone = Global> {
     inner: Iter<'a, K, V, A>,
 }
 
@@ -2446,7 +2442,7 @@ impl<K: Debug + Clone, V, A: Allocator + Clone> fmt::Debug for Keys<'_, K, V, A>
 /// assert_eq!(values.next(), None);
 /// assert_eq!(values.next(), None);
 /// ```
-pub struct Values<'a, K: Clone, V, A: Allocator + Clone> {
+pub struct Values<'a, K: Clone, V, A: Allocator + Clone = Global> {
     inner: Iter<'a, K, V, A>,
 }
 
@@ -2612,7 +2608,7 @@ impl<K: Clone, V: Clone, F, A: Allocator + Clone> FusedIterator for ExtractIf<'_
 /// assert_eq!(map.get(&1).unwrap(), Arc::new("One Mississippi".to_owned()));
 /// assert_eq!(map.get(&2).unwrap(), Arc::new("Two Mississippi".to_owned()));
 /// ```
-pub struct ValuesMut<'a, K: Clone, V, A: Allocator + Clone> {
+pub struct ValuesMut<'a, K: Clone, V, A: Allocator + Clone = Global> {
     inner: IterMut<'a, K, V, A>,
 }
 
