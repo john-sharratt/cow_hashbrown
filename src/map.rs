@@ -4218,7 +4218,7 @@ pub struct OccupiedError<'a, K: Clone, V, S, A: Allocator + Clone = Global> {
 }
 
 impl<'a, K: Clone, V, S, A: Allocator + Clone> IntoIterator for &'a CowHashMap<K, V, S, A> {
-    type Item = (&'a K, Arc<V>);
+    type Item = (K, Arc<V>);
     type IntoIter = Iter<'a, K, V, A>;
 
     /// Creates an iterator over the entries of a `HashMap` in arbitrary order.
@@ -4248,7 +4248,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> IntoIterator for &'a CowHashMap<K
 }
 
 impl<'a, K: Clone, V, S, A: Allocator + Clone> IntoIterator for &'a mut CowHashMap<K, V, S, A> {
-    type Item = (&'a K, CowValueGuard<V>);
+    type Item = (K, CowValueGuard<V>);
     type IntoIter = IterMut<'a, K, V, A>;
 
     /// Creates an iterator over the entries of a `HashMap` in arbitrary order
@@ -4319,15 +4319,15 @@ impl<'a, K: Clone, V, A> Iterator for Iter<'a, K, V, A>
 where
     A: Allocator + Clone,
 {
-    type Item = (&'a K, Arc<V>);
+    type Item = (K, Arc<V>);
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<(&'a K, Arc<V>)> {
+    fn next(&mut self) -> Option<(K, Arc<V>)> {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.inner.next() {
             Some(x) => unsafe {
                 let r = x.as_ref();
-                Some((&r.0, r.1.load_full()))
+                Some((r.0.clone(), r.1.load_full()))
             },
             None => None,
         }
@@ -4353,15 +4353,15 @@ impl<'a, K: Clone, V, A> Iterator for IterMut<'a, K, V, A>
 where
     A: Allocator + Clone,
 {
-    type Item = (&'a K, CowValueGuard<V>);
+    type Item = (K, CowValueGuard<V>);
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<(&'a K, CowValueGuard<V>)> {
+    fn next(&mut self) -> Option<(K, CowValueGuard<V>)> {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.inner.next() {
             Some(x) => unsafe {
                 let r = x.as_mut();
-                Some((&r.0, CowValueGuard::new(r.1.clone())))
+                Some((r.0.clone(), CowValueGuard::new(r.1.clone())))
             },
             None => None,
         }
@@ -4426,10 +4426,10 @@ impl<K: Debug + Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for In
 }
 
 impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Keys<'a, K, V, A> {
-    type Item = &'a K;
+    type Item = K;
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<&'a K> {
+    fn next(&mut self) -> Option<K> {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.inner.next() {
             Some((k, _)) => Some(k),
@@ -6835,8 +6835,8 @@ mod test_map {
         let mut observed: u32 = 0;
 
         for (k, v) in &m {
-            assert_eq!(*v, *k * 2);
-            observed |= 1 << *k;
+            assert_eq!(*v, k * 2);
+            observed |= 1 << k;
         }
         assert_eq!(observed, 0xFFFF_FFFF);
     }
@@ -6845,7 +6845,7 @@ mod test_map {
     fn test_keys() {
         let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
         let map: CowHashMap<_, _> = vec.into_iter().collect();
-        let keys: Vec<_> = map.keys().copied().collect();
+        let keys: Vec<_> = map.keys().collect();
         assert_eq!(keys.len(), 3);
         assert!(keys.contains(&1));
         assert!(keys.contains(&2));
@@ -7215,7 +7215,7 @@ mod test_map {
                               // Test for #19292
         fn check(m: &CowHashMap<i32, ()>) {
             for k in m.keys() {
-                assert!(m.contains_key(k), "{k} is in keys() but not in the map?");
+                assert!(m.contains_key(&k), "{k} is in keys() but not in the map?");
             }
         }
 
@@ -7251,7 +7251,7 @@ mod test_map {
                               // Test for #19292
         fn check(m: &CowHashMap<std::string::String, ()>) {
             for k in m.keys() {
-                assert!(m.contains_key(k), "{k} is in keys() but not in the map?");
+                assert!(m.contains_key(&k), "{k} is in keys() but not in the map?");
             }
         }
 
@@ -7602,7 +7602,7 @@ mod test_map {
                               // Test for #19292
         fn check(m: &CowHashMap<i32, ()>) {
             for k in m.keys() {
-                assert!(m.contains_key(k), "{k} is in keys() but not in the map?");
+                assert!(m.contains_key(&k), "{k} is in keys() but not in the map?");
             }
         }
 
@@ -7632,7 +7632,7 @@ mod test_map {
                               // Test for #19292
         fn check(m: &CowHashMap<std::string::String, ()>) {
             for k in m.keys() {
-                assert!(m.contains_key(k), "{k} is in keys() but not in the map?");
+                assert!(m.contains_key(&k), "{k} is in keys() but not in the map?");
             }
         }
 
