@@ -91,7 +91,7 @@ hashbrown = "0.14"
 Then:
 
 ```rust
-use hashbrown::HashMap;
+use cow_hashbrown::HashMap;
 
 let mut map = HashMap::new();
 map.insert(1, "one");

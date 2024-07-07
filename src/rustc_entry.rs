@@ -16,7 +16,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::HashMap;
     ///
     /// let mut letters = HashMap::new();
     ///
@@ -142,7 +142,7 @@ impl<'a, K, V, A: Allocator> RustcEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// let entry = map.rustc_entry("horseyland").insert(37);
@@ -165,7 +165,7 @@ impl<'a, K, V, A: Allocator> RustcEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -192,7 +192,7 @@ impl<'a, K, V, A: Allocator> RustcEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::HashMap;
     ///
     /// let mut map: HashMap<&str, String> = HashMap::new();
     /// let s = "hoho".to_string();
@@ -217,7 +217,7 @@ impl<'a, K, V, A: Allocator> RustcEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// assert_eq!(map.rustc_entry("poneyland").key(), &"poneyland");
@@ -236,7 +236,7 @@ impl<'a, K, V, A: Allocator> RustcEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -273,7 +273,7 @@ impl<'a, K, V: Default, A: Allocator> RustcEntry<'a, K, V, A> {
     ///
     /// ```
     /// # fn main() {
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::HashMap;
     ///
     /// let mut map: HashMap<&str, Option<u32>> = HashMap::new();
     /// map.rustc_entry("poneyland").or_default();
@@ -299,7 +299,7 @@ impl<'a, K, V, A: Allocator> RustcOccupiedEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.rustc_entry("poneyland").or_insert(12);
@@ -315,8 +315,8 @@ impl<'a, K, V, A: Allocator> RustcOccupiedEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RustcEntry;
+    /// use cow_hashbrown::HashMap;
+    /// use cow_hashbrown::hash_map::RustcEntry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.rustc_entry("poneyland").or_insert(12);
@@ -338,8 +338,8 @@ impl<'a, K, V, A: Allocator> RustcOccupiedEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RustcEntry;
+    /// use cow_hashbrown::HashMap;
+    /// use cow_hashbrown::hash_map::RustcEntry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.rustc_entry("poneyland").or_insert(12);
@@ -363,8 +363,8 @@ impl<'a, K, V, A: Allocator> RustcOccupiedEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RustcEntry;
+    /// use cow_hashbrown::HashMap;
+    /// use cow_hashbrown::hash_map::RustcEntry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.rustc_entry("poneyland").or_insert(12);
@@ -395,8 +395,8 @@ impl<'a, K, V, A: Allocator> RustcOccupiedEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RustcEntry;
+    /// use cow_hashbrown::HashMap;
+    /// use cow_hashbrown::hash_map::RustcEntry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.rustc_entry("poneyland").or_insert(12);
@@ -418,8 +418,8 @@ impl<'a, K, V, A: Allocator> RustcOccupiedEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RustcEntry;
+    /// use cow_hashbrown::HashMap;
+    /// use cow_hashbrown::hash_map::RustcEntry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.rustc_entry("poneyland").or_insert(12);
@@ -440,8 +440,8 @@ impl<'a, K, V, A: Allocator> RustcOccupiedEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RustcEntry;
+    /// use cow_hashbrown::HashMap;
+    /// use cow_hashbrown::hash_map::RustcEntry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.rustc_entry("poneyland").or_insert(12);
@@ -463,7 +463,7 @@ impl<'a, K, V, A: Allocator> RustcOccupiedEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{RustcEntry, HashMap};
+    /// use cow_hashbrown::hash_map::{RustcEntry, HashMap};
     /// use std::rc::Rc;
     ///
     /// let mut map: HashMap<Rc<String>, u32> = HashMap::new();
@@ -492,7 +492,7 @@ impl<'a, K, V, A: Allocator> RustcOccupiedEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{RustcEntry, HashMap};
+    /// use cow_hashbrown::hash_map::{RustcEntry, HashMap};
     /// use std::rc::Rc;
     ///
     /// let mut map: HashMap<Rc<String>, u32> = HashMap::new();
@@ -525,7 +525,7 @@ impl<'a, K, V, A: Allocator> RustcVacantEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// assert_eq!(map.rustc_entry("poneyland").key(), &"poneyland");
@@ -540,8 +540,8 @@ impl<'a, K, V, A: Allocator> RustcVacantEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RustcEntry;
+    /// use cow_hashbrown::HashMap;
+    /// use cow_hashbrown::hash_map::RustcEntry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -560,8 +560,8 @@ impl<'a, K, V, A: Allocator> RustcVacantEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RustcEntry;
+    /// use cow_hashbrown::HashMap;
+    /// use cow_hashbrown::hash_map::RustcEntry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -584,8 +584,8 @@ impl<'a, K, V, A: Allocator> RustcVacantEntry<'a, K, V, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RustcEntry;
+    /// use cow_hashbrown::HashMap;
+    /// use cow_hashbrown::hash_map::RustcEntry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///

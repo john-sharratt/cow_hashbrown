@@ -2,7 +2,7 @@
 
 use core::hash::BuildHasherDefault;
 use fnv::FnvHasher;
-use hashbrown::{HashMap, HashSet};
+use cow_hashbrown::{CowHashMap, HashSet};
 use serde_test::{assert_tokens, Token};
 
 // We use FnvHash for this test because we rely on the ordering

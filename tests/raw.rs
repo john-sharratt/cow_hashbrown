@@ -1,6 +1,6 @@
 #![cfg(feature = "raw")]
 
-use hashbrown::raw::RawTable;
+use cow_hashbrown::raw::RawTable;
 use std::mem;
 
 #[test]

@@ -1,7 +1,8 @@
-use hashbrown::Equivalent;
-use hashbrown::HashMap;
+use cow_hashbrown::CowHashMap;
+use cow_hashbrown::Equivalent;
 
 use std::hash::Hash;
+use std::sync::Arc;
 
 #[derive(Debug, Hash)]
 pub struct Pair<A, B>(pub A, pub B);
@@ -30,7 +31,7 @@ where
 #[test]
 fn test_lookup() {
     let s = String::from;
-    let mut map = HashMap::new();
+    let mut map = CowHashMap::new();
     map.insert((s("a"), s("b")), 1);
     map.insert((s("a"), s("x")), 2);
 
@@ -41,7 +42,7 @@ fn test_lookup() {
 #[test]
 fn test_string_str() {
     let s = String::from;
-    let mut map = HashMap::new();
+    let mut map = CowHashMap::new();
     map.insert(s("a"), 1);
     map.insert(s("b"), 2);
     map.insert(s("x"), 3);
@@ -49,5 +50,5 @@ fn test_string_str() {
 
     assert!(map.contains_key("a"));
     assert!(!map.contains_key("z"));
-    assert_eq!(map.remove("b"), Some(2));
+    assert_eq!(map.remove("b"), Some(Arc::new(2)));
 }

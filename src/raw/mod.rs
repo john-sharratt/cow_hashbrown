@@ -1,3 +1,6 @@
+use ::alloc::sync::Arc;
+use arc_swap::{ArcSwap, AsRaw, DefaultStrategy, Guard};
+
 use crate::alloc::alloc::{handle_alloc_error, Layout};
 use crate::scopeguard::{guard, ScopeGuard};
 use crate::TryReserveError;
@@ -5,6 +8,7 @@ use core::iter::FusedIterator;
 use core::marker::PhantomData;
 use core::mem;
 use core::mem::MaybeUninit;
+use core::ops::Deref;
 use core::ptr::NonNull;
 use core::{hint, ptr};
 
@@ -481,7 +485,7 @@ impl<T> Bucket<T> {
     /// # #[cfg(feature = "raw")]
     /// # fn test() {
     /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::raw::{Bucket, RawTable};
+    /// use cow_hashbrown::raw::{Bucket, RawTable};
     ///
     /// type NewHashBuilder = hashbrown::DefaultHashBuilder;
     ///
@@ -647,7 +651,7 @@ impl<T> Bucket<T> {
     /// # #[cfg(feature = "raw")]
     /// # fn test() {
     /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::raw::{Bucket, RawTable};
+    /// use cow_hashbrown::raw::{Bucket, RawTable};
     ///
     /// type NewHashBuilder = hashbrown::DefaultHashBuilder;
     ///
@@ -706,7 +710,7 @@ impl<T> Bucket<T> {
     /// # #[cfg(feature = "raw")]
     /// # fn test() {
     /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::raw::{Bucket, RawTable};
+    /// use cow_hashbrown::raw::{Bucket, RawTable};
     ///
     /// type NewHashBuilder = hashbrown::DefaultHashBuilder;
     ///
@@ -782,6 +786,161 @@ impl<T> Bucket<T> {
     }
 }
 
+/// A raw hash table with copy-on-write support
+pub struct CowRawTable<T, A: Allocator + Clone = Global> {
+    pub(crate) inner: ArcSwap<RawTable<T, A>>,
+}
+
+impl<T> CowRawTable<T, Global> {
+    pub fn new() -> Self {
+        Self {
+            inner: ArcSwap::new(Arc::new(RawTable::new())),
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: ArcSwap::new(Arc::new(RawTable::with_capacity(capacity))),
+        }
+    }
+}
+
+pub(crate) struct RawTableGuard<'a, T, A: Allocator + Clone, R> {
+    pub(crate) guard: Arc<RawTable<T, A>>,
+    pub(crate) inner: R,
+    pub(crate) _phantom: PhantomData<&'a ()>,
+}
+
+impl<'a, T, A: Allocator + Clone, R> Deref for RawTableGuard<'_, T, A, R> {
+    type Target = R;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T, A: Allocator> CowRawTable<T, A>
+where
+    A: Allocator + Clone,
+{
+    /// Creates a new empty hash table without allocating any memory, using the
+    /// given allocator.
+    ///
+    /// In effect this returns a table with exactly 1 bucket. However we can
+    /// leave the data pointer dangling since that bucket is never written to
+    /// due to our load factor forcing us to always have at least 1 free bucket.
+    #[inline]
+    pub fn new_in(alloc: A) -> Self {
+        Self {
+            inner: ArcSwap::new(Arc::new(RawTable {
+                table: RawTableInner::NEW,
+                alloc,
+                marker: PhantomData,
+            })),
+        }
+    }
+
+    /// Allocates a new hash table using the given allocator, with at least enough capacity for
+    /// inserting the given number of elements without reallocating.
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        Self {
+            inner: ArcSwap::new(Arc::new(RawTable {
+                table: RawTableInner::with_capacity(
+                    &alloc,
+                    RawTable::<T, A>::TABLE_LAYOUT,
+                    capacity,
+                ),
+                alloc,
+                marker: PhantomData,
+            })),
+        }
+    }
+
+    pub fn map<'a, 'b, R, F>(&'a self, f: F) -> RawTableGuard<'b, T, A, R>
+    where
+        F: Fn(&'b RawTable<T, A>) -> R,
+        T: 'b,
+        A: 'b,
+    {
+        let guard: Arc<RawTable<T, A>> = self.inner.load().clone();
+
+        let guard_ptr: &RawTable<T, A> = guard.deref();
+        let guard_ptr = unsafe { mem::transmute(guard_ptr) };
+        let ret = f(guard_ptr);
+        RawTableGuard {
+            guard,
+            inner: ret,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn rcu<'a, 'b, F, R>(&'a self, mut f: F) -> RawTableGuard<'b, T, A, R>
+    where
+        F: FnMut(&'b mut RawTable<T, A>) -> R,
+        T: Clone + 'b,
+        A: 'b,
+    {
+        let mut cur = self.inner.load();
+        loop {
+            let new = cur.as_ref().clone();
+            let mut new = Arc::new(new);
+
+            let new_ptr: &mut RawTable<T, A> = Arc::get_mut(&mut new).unwrap();
+            let new_ptr = unsafe { mem::transmute(new_ptr) };
+            let ret: R = f(new_ptr);
+
+            let prev = self.inner.compare_and_swap(&*cur, new.clone());
+            let swapped = ptr_eq(&*cur, &*prev);
+            if swapped {
+                return RawTableGuard {
+                    guard: new,
+                    inner: ret,
+                    _phantom: PhantomData,
+                };
+            } else {
+                cur = prev;
+            }
+        }
+    }
+
+    /// Returns an iterator over every element in the table. It is up to
+    /// the caller to ensure that the `RawTable` outlives the `RawIter`.
+    /// Because we cannot make the `next` method unsafe on the `RawIter`
+    /// struct, we have to make the `iter` method unsafe.
+    #[inline]
+    pub unsafe fn iter(&self) -> CowRawIter<T, A> {
+        let guard = self.inner.load();
+        CowRawIter {
+            inner: guard.iter(),
+            guard,
+        }
+    }
+}
+
+impl<T, A: Allocator + Clone> IntoIterator for CowRawTable<T, A> {
+    type Item = Bucket<T>;
+    type IntoIter = CowRawIntoIter<T, A>;
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn into_iter(self) -> CowRawIntoIter<T, A> {
+        CowRawIntoIter {
+            iter: unsafe { self.iter() },
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T, A: Allocator> Clone for CowRawTable<T, A>
+where
+    A: Allocator + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: ArcSwap::new(Arc::clone(&self.inner.load())),
+        }
+    }
+}
+
 /// A raw hash table with an unsafe API.
 pub struct RawTable<T, A: Allocator = Global> {
     table: RawTableInner,
@@ -815,7 +974,7 @@ impl<T> RawTable<T, Global> {
     /// leave the data pointer dangling since that bucket is never written to
     /// due to our load factor forcing us to always have at least 1 free bucket.
     #[inline]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             table: RawTableInner::NEW,
             alloc: Global,
@@ -1376,6 +1535,7 @@ impl<T, A: Allocator> RawTable<T, A> {
     /// Returns `true` if the bucket still contains an element
     ///
     /// This does not check if the given bucket is actually occupied.
+    #[allow(dead_code)]
     #[cfg_attr(feature = "inline-more", inline)]
     pub unsafe fn replace_bucket_with<F>(&mut self, bucket: Bucket<T>, f: F) -> bool
     where
@@ -1484,6 +1644,7 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     /// Gets a mutable reference to an element in the table.
     #[inline]
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&mut T> {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.find(hash, eq) {
@@ -1501,6 +1662,7 @@ impl<T, A: Allocator> RawTable<T, A> {
     ///
     /// The `eq` argument should be a closure such that `eq(i, k)` returns true if `k` is equal to
     /// the `i`th key to be looked up.
+    #[allow(dead_code)]
     pub fn get_many_mut<const N: usize>(
         &mut self,
         hashes: [u64; N],
@@ -1522,6 +1684,7 @@ impl<T, A: Allocator> RawTable<T, A> {
         }
     }
 
+    #[allow(dead_code)]
     pub unsafe fn get_many_unchecked_mut<const N: usize>(
         &mut self,
         hashes: [u64; N],
@@ -1681,6 +1844,17 @@ impl<T, A: Allocator> RawTable<T, A> {
         mem::forget(self);
         alloc
     }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn ptr_eq<Base, A, B>(a: A, b: B) -> bool
+where
+    A: AsRaw<Base>,
+    B: AsRaw<Base>,
+{
+    let a = a.as_raw();
+    let b = b.as_raw();
+    ptr::eq(a, b)
 }
 
 unsafe impl<T, A: Allocator> Send for RawTable<T, A>
@@ -3981,6 +4155,57 @@ pub struct RawIter<T> {
     items: usize,
 }
 
+/// Cow raw iterator with a guard that protects the data
+pub struct CowRawIter<T, A>
+where
+    A: Allocator + Clone,
+{
+    pub(crate) guard: Guard<Arc<RawTable<T, A>>, DefaultStrategy>,
+    pub(crate) inner: RawIter<T>,
+}
+
+impl<T, A> Clone for CowRawIter<T, A>
+where
+    A: Allocator + Clone,
+{
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn clone(&self) -> Self {
+        Self {
+            guard: Guard::from_inner(self.guard.clone()),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T, A> Iterator for CowRawIter<T, A>
+where
+    A: Allocator + Clone,
+{
+    type Item = Bucket<T>;
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn next(&mut self) -> Option<Bucket<T>> {
+        self.inner.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+
+    #[inline]
+    fn fold<B, F>(self, init: B, f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B,
+    {
+        self.inner.fold(init, f)
+    }
+}
+
+impl<T, A> ExactSizeIterator for CowRawIter<T, A> where A: Allocator + Clone {}
+impl<T, A> FusedIterator for CowRawIter<T, A> where A: Allocator + Clone {}
+
 impl<T> RawIter<T> {
     /// Refresh the iterator so that it reflects a removal from the given bucket.
     ///
@@ -4282,6 +4507,7 @@ pub struct RawIntoIter<T, A: Allocator = Global> {
 }
 
 impl<T, A: Allocator> RawIntoIter<T, A> {
+    #[allow(dead_code)]
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn iter(&self) -> RawIter<T> {
         self.iter.clone()
@@ -4295,6 +4521,49 @@ where
 {
 }
 unsafe impl<T, A: Allocator> Sync for RawIntoIter<T, A>
+where
+    T: Sync,
+    A: Sync,
+{
+}
+
+/// Iterator which consumes a table and returns elements.
+pub struct CowRawIntoIter<T, A: Allocator + Clone = Global> {
+    iter: CowRawIter<T, A>,
+    marker: PhantomData<T>,
+}
+
+impl<T, A: Allocator + Clone> CowRawIntoIter<T, A> {
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn iter(&self) -> CowRawIter<T, A> {
+        self.iter.clone()
+    }
+}
+
+impl<T, A: Allocator + Clone> Iterator for CowRawIntoIter<T, A> {
+    type Item = Bucket<T>;
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn next(&mut self) -> Option<Bucket<T>> {
+        Some(self.iter.next()?)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<T, A: Allocator + Clone> ExactSizeIterator for CowRawIntoIter<T, A> {}
+impl<T, A: Allocator + Clone> FusedIterator for CowRawIntoIter<T, A> {}
+
+unsafe impl<T, A: Allocator + Clone> Send for CowRawIntoIter<T, A>
+where
+    T: Send,
+    A: Send,
+{
+}
+unsafe impl<T, A: Allocator + Clone> Sync for CowRawIntoIter<T, A>
 where
     T: Sync,
     A: Sync,
@@ -4545,25 +4814,29 @@ impl Iterator for RawIterHashInner {
     }
 }
 
-pub(crate) struct RawExtractIf<'a, T, A: Allocator> {
-    pub iter: RawIter<T>,
-    pub table: &'a mut RawTable<T, A>,
+pub(crate) struct RawExtractIf<'a, T, A: Allocator + Clone> {
+    pub iter: CowRawIter<T, A>,
+    pub table: &'a CowRawTable<T, A>,
 }
 
-impl<T, A: Allocator> RawExtractIf<'_, T, A> {
+impl<T: Clone, A: Allocator + Clone> RawExtractIf<'_, T, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub(crate) fn next<F>(&mut self, mut f: F) -> Option<T>
     where
         F: FnMut(&mut T) -> bool,
     {
         unsafe {
-            for item in &mut self.iter {
-                if f(item.as_mut()) {
-                    return Some(self.table.remove(item).0);
+            let mut ret = None;
+            self.table.rcu(|t| {
+                for item in &mut self.iter {
+                    if f(item.as_mut()) {
+                        ret = Some(t.remove(item).0);
+                        break;
+                    }
                 }
-            }
+            });
+            ret
         }
-        None
     }
 }
 

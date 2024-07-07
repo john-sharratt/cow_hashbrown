@@ -1,14 +1,18 @@
+use alloc::sync::Arc;
+use arc_swap::{ArcSwap, Guard};
+
 use crate::raw::{
-    Allocator, Bucket, Global, RawDrain, RawExtractIf, RawIntoIter, RawIter, RawTable,
+    Allocator, Bucket, CowRawIntoIter, CowRawIter, CowRawTable, Global, RawDrain, RawExtractIf,
+    RawTableGuard,
 };
-use crate::{DefaultHashBuilder, Equivalent, TryReserveError};
+use crate::{ptr_eq, DefaultHashBuilder, Equivalent, TryReserveError};
 use core::borrow::Borrow;
 use core::fmt::{self, Debug};
 use core::hash::{BuildHasher, Hash};
 use core::iter::FusedIterator;
 use core::marker::PhantomData;
 use core::mem;
-use core::ops::Index;
+use core::ops::{Deref, DerefMut};
 
 /// A hash map implemented with quadratic probing and SIMD lookup.
 ///
@@ -45,7 +49,7 @@ use core::ops::Index;
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// // Type inference lets us omit an explicit type signature (which
 /// // would be `HashMap<String, String>` in this example).
@@ -90,7 +94,7 @@ use core::ops::Index;
 /// }
 ///
 /// // Look up the value for a key (will panic if the key is not found).
-/// println!("Review for Jane: {}", book_reviews["Pride and Prejudice"]);
+/// println!("Review for Jane: {}", book_reviews.get("Pride and Prejudice").unwrap());
 ///
 /// // Iterate over everything.
 /// for (book, review) in &book_reviews {
@@ -103,7 +107,7 @@ use core::ops::Index;
 /// their values:
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// // type inference lets us omit an explicit type signature (which
 /// // would be `HashMap<&str, u8>` in this example).
@@ -123,7 +127,7 @@ use core::ops::Index;
 /// player_stats.entry("defence").or_insert_with(random_stat_buff);
 ///
 /// // update a key, guarding against the key possibly not being set
-/// let stat = player_stats.entry("attack").or_insert(100);
+/// let mut stat = player_stats.entry("attack").or_insert(100);
 /// *stat += random_stat_buff();
 /// ```
 ///
@@ -142,7 +146,7 @@ use core::ops::Index;
 /// [`AHash`]: https://crates.io/crates/ahash
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// #[derive(Hash, Eq, PartialEq, Debug)]
 /// struct Viking {
@@ -173,20 +177,20 @@ use core::ops::Index;
 /// A `HashMap` with fixed list of elements can be initialized from an array:
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// let timber_resources: HashMap<&str, i32> = [("Norway", 100), ("Denmark", 50), ("Iceland", 10)]
 ///     .into_iter().collect();
 /// // use the values stored in map
 /// ```
-pub struct HashMap<K, V, S = DefaultHashBuilder, A: Allocator = Global> {
+pub struct CowHashMap<K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     pub(crate) hash_builder: S,
-    pub(crate) table: RawTable<(K, V), A>,
+    pub(crate) table: CowRawTable<(K, Arc<ArcSwap<V>>), A>,
 }
 
-impl<K: Clone, V: Clone, S: Clone, A: Allocator + Clone> Clone for HashMap<K, V, S, A> {
+impl<K: Clone, V, S: Clone, A: Allocator + Clone> Clone for CowHashMap<K, V, S, A> {
     fn clone(&self) -> Self {
-        HashMap {
+        CowHashMap {
             hash_builder: self.hash_builder.clone(),
             table: self.table.clone(),
         }
@@ -223,6 +227,7 @@ where
 
 /// Ensures that a single closure type across uses of this which, in turn prevents multiple
 /// instances of any functions like RawTable::reserve from being generated
+#[allow(dead_code)]
 #[cfg_attr(feature = "inline-more", inline)]
 fn equivalent<Q, K>(k: &Q) -> impl Fn(&K) -> bool + '_
 where
@@ -254,8 +259,134 @@ where
     hash_builder.hash_one(val)
 }
 
+enum CowValueGuardMode<T> {
+    Read(Arc<T>),
+    Write(Option<T>),
+}
+
+/// A guard for a value in a `CowHashMap`.
+pub struct CowValueGuard<V> {
+    inner: Arc<ArcSwap<V>>,
+    mode: CowValueGuardMode<V>,
+}
+
+impl<V> CowValueGuard<V> {
+    /// Creates a new `CowValueGuard`.
+    pub fn new(inner: Arc<ArcSwap<V>>) -> Self {
+        Self {
+            mode: CowValueGuardMode::Read(inner.load_full()),
+            inner,
+        }
+    }
+}
+
+impl<V> PartialEq<V> for CowValueGuard<V>
+where
+    V: PartialEq<V>,
+{
+    fn eq(&self, other: &V) -> bool {
+        match (self, other) {
+            (
+                CowValueGuard {
+                    mode: CowValueGuardMode::Read(inner),
+                    ..
+                },
+                other,
+            ) => inner.as_ref() == other,
+            (
+                CowValueGuard {
+                    mode: CowValueGuardMode::Write(inner),
+                    ..
+                },
+                other,
+            ) => inner.as_ref() == Some(other),
+        }
+    }
+}
+
+impl<V> PartialEq for CowValueGuard<V>
+where
+    V: PartialEq<V>,
+{
+    fn eq(&self, other: &CowValueGuard<V>) -> bool {
+        match (self, other) {
+            (
+                CowValueGuard {
+                    mode: CowValueGuardMode::Read(inner),
+                    ..
+                },
+                other,
+            ) => inner.as_ref() == other.deref(),
+            (
+                CowValueGuard {
+                    mode: CowValueGuardMode::Write(inner),
+                    ..
+                },
+                other,
+            ) => inner.as_ref() == Some(other.deref()),
+        }
+    }
+}
+
+impl<V> Debug for CowValueGuard<V>
+where
+    V: Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.mode {
+            CowValueGuardMode::Read(inner) => inner.as_ref().fmt(f),
+            CowValueGuardMode::Write(inner) => inner.as_ref().fmt(f),
+        }
+    }
+}
+
+impl<V> Eq for CowValueGuard<V> where V: Eq {}
+
+impl<V> Deref for CowValueGuard<V> {
+    type Target = V;
+
+    fn deref(&self) -> &V {
+        match &self.mode {
+            CowValueGuardMode::Read(inner) => inner.as_ref(),
+            CowValueGuardMode::Write(inner) => inner.as_ref().unwrap(),
+        }
+    }
+}
+
+impl<V> DerefMut for CowValueGuard<V>
+where
+    V: Clone,
+{
+    fn deref_mut(&mut self) -> &mut V {
+        match &mut self.mode {
+            CowValueGuardMode::Read(inner) => {
+                let inner = inner.as_ref().clone();
+                self.mode = CowValueGuardMode::Write(Some(inner));
+            }
+            CowValueGuardMode::Write(_) => {}
+        }
+        match &mut self.mode {
+            CowValueGuardMode::Read(_) => unreachable!(),
+            CowValueGuardMode::Write(inner) => inner.as_mut().unwrap(),
+        }
+    }
+}
+
+impl<V> Drop for CowValueGuard<V> {
+    fn drop(&mut self) {
+        match &mut self.mode {
+            CowValueGuardMode::Read(_) => {}
+            CowValueGuardMode::Write(inner) => {
+                if let Some(inner) = inner.take() {
+                    self.inner.store(Arc::new(inner));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "default-hasher")]
-impl<K, V> HashMap<K, V, DefaultHashBuilder> {
+impl<K: Clone, V> CowHashMap<K, V, DefaultHashBuilder> {
     /// Creates an empty `HashMap`.
     ///
     /// The hash map is initially created with a capacity of 0, so it will not allocate until it
@@ -276,7 +407,7 @@ impl<K, V> HashMap<K, V, DefaultHashBuilder> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     /// let mut map: HashMap<&str, i32> = HashMap::new();
     /// assert_eq!(map.len(), 0);
     /// assert_eq!(map.capacity(), 0);
@@ -306,7 +437,7 @@ impl<K, V> HashMap<K, V, DefaultHashBuilder> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     /// let mut map: HashMap<&str, i32> = HashMap::with_capacity(10);
     /// assert_eq!(map.len(), 0);
     /// assert!(map.capacity() >= 10);
@@ -318,7 +449,7 @@ impl<K, V> HashMap<K, V, DefaultHashBuilder> {
 }
 
 #[cfg(feature = "default-hasher")]
-impl<K, V, A: Allocator> HashMap<K, V, DefaultHashBuilder, A> {
+impl<K: Clone, V, A: Allocator + Clone> CowHashMap<K, V, DefaultHashBuilder, A> {
     /// Creates an empty `HashMap` using the given allocator.
     ///
     /// The hash map is initially created with a capacity of 0, so it will not allocate until it
@@ -339,7 +470,7 @@ impl<K, V, A: Allocator> HashMap<K, V, DefaultHashBuilder, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     /// use bumpalo::Bump;
     ///
     /// let bump = Bump::new();
@@ -383,7 +514,7 @@ impl<K, V, A: Allocator> HashMap<K, V, DefaultHashBuilder, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     /// use bumpalo::Bump;
     ///
     /// let bump = Bump::new();
@@ -413,7 +544,7 @@ impl<K, V, A: Allocator> HashMap<K, V, DefaultHashBuilder, A> {
     }
 }
 
-impl<K, V, S> HashMap<K, V, S> {
+impl<K: Clone, V, S> CowHashMap<K, V, S> {
     /// Creates an empty `HashMap` which will use the given hash builder to hash
     /// keys.
     ///
@@ -438,8 +569,8 @@ impl<K, V, S> HashMap<K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let s = DefaultHashBuilder::default();
     /// let mut map = HashMap::with_hasher(s);
@@ -449,10 +580,10 @@ impl<K, V, S> HashMap<K, V, S> {
     /// map.insert(1, 2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub const fn with_hasher(hash_builder: S) -> Self {
+    pub fn with_hasher(hash_builder: S) -> Self {
         Self {
             hash_builder,
-            table: RawTable::new(),
+            table: CowRawTable::new(),
         }
     }
 
@@ -480,8 +611,8 @@ impl<K, V, S> HashMap<K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let s = DefaultHashBuilder::default();
     /// let mut map = HashMap::with_capacity_and_hasher(10, s);
@@ -494,16 +625,16 @@ impl<K, V, S> HashMap<K, V, S> {
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
         Self {
             hash_builder,
-            table: RawTable::with_capacity(capacity),
+            table: CowRawTable::with_capacity(capacity),
         }
     }
 }
 
-impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
+impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// Returns a reference to the underlying allocator.
     #[inline]
-    pub fn allocator(&self) -> &A {
-        self.table.allocator()
+    pub fn allocator(&self) -> A {
+        self.table.map(|t| t.allocator()).clone()
     }
 
     /// Creates an empty `HashMap` which will use the given hash builder to hash
@@ -526,18 +657,18 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let s = DefaultHashBuilder::default();
     /// let mut map = HashMap::with_hasher(s);
     /// map.insert(1, 2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub const fn with_hasher_in(hash_builder: S, alloc: A) -> Self {
+    pub fn with_hasher_in(hash_builder: S, alloc: A) -> Self {
         Self {
             hash_builder,
-            table: RawTable::new_in(alloc),
+            table: CowRawTable::new_in(alloc),
         }
     }
 
@@ -561,8 +692,8 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let s = DefaultHashBuilder::default();
     /// let mut map = HashMap::with_capacity_and_hasher(10, s);
@@ -572,7 +703,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     pub fn with_capacity_and_hasher_in(capacity: usize, hash_builder: S, alloc: A) -> Self {
         Self {
             hash_builder,
-            table: RawTable::with_capacity_in(capacity, alloc),
+            table: CowRawTable::with_capacity_in(capacity, alloc),
         }
     }
 
@@ -583,8 +714,8 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let hasher = DefaultHashBuilder::default();
     /// let map: HashMap<i32, i32> = HashMap::with_hasher(hasher);
@@ -603,14 +734,14 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     /// let map: HashMap<i32, i32> = HashMap::with_capacity(100);
     /// assert_eq!(map.len(), 0);
     /// assert!(map.capacity() >= 100);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn capacity(&self) -> usize {
-        self.table.capacity()
+        self.table.map(|t| t.capacity()).inner
     }
 
     /// An iterator visiting all keys in arbitrary order.
@@ -619,7 +750,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert("a", 1);
@@ -641,7 +772,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn keys(&self) -> Keys<'_, K, V> {
+    pub fn keys(&self) -> Keys<'_, K, V, A> {
         Keys { inner: self.iter() }
     }
 
@@ -651,7 +782,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert("a", 1);
@@ -673,7 +804,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn values(&self) -> Values<'_, K, V> {
+    pub fn values(&self) -> Values<'_, K, V, A> {
         Values { inner: self.iter() }
     }
 
@@ -683,7 +814,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     ///
@@ -711,7 +842,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn values_mut(&mut self) -> ValuesMut<'_, K, V> {
+    pub fn values_mut(&self) -> ValuesMut<'_, K, V, A> {
         ValuesMut {
             inner: self.iter_mut(),
         }
@@ -723,7 +854,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert("a", 1);
@@ -745,7 +876,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn iter(&self) -> Iter<'_, K, V> {
+    pub fn iter(&self) -> Iter<'_, K, V, A> {
         // Here we tie the lifetime of self to the iter.
         unsafe {
             Iter {
@@ -762,7 +893,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert("a", 1);
@@ -790,7 +921,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+    pub fn iter_mut(&self) -> IterMut<'_, K, V, A> {
         // Here we tie the lifetime of self to the iter.
         unsafe {
             IterMut {
@@ -803,7 +934,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     #[cfg(test)]
     #[cfg_attr(feature = "inline-more", inline)]
     fn raw_capacity(&self) -> usize {
-        self.table.buckets()
+        self.table.map(|t| t.buckets()).inner
     }
 
     /// Returns the number of elements in the map.
@@ -811,7 +942,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut a = HashMap::new();
     /// assert_eq!(a.len(), 0);
@@ -820,7 +951,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn len(&self) -> usize {
-        self.table.len()
+        self.table.map(|t| t.len()).inner
     }
 
     /// Returns `true` if the map contains no elements.
@@ -828,7 +959,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut a = HashMap::new();
     /// assert!(a.is_empty());
@@ -850,7 +981,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut a = HashMap::new();
     /// a.insert(1, "a");
@@ -879,9 +1010,9 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// assert!(a.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn drain(&mut self) -> Drain<'_, K, V, A> {
+    pub fn drain(&self) -> Drain<'_, K, V, A> {
         Drain {
-            inner: self.table.drain(),
+            inner: self.table.rcu(|t| t.drain()),
         }
     }
 
@@ -894,7 +1025,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<i32, i32> = (0..8).map(|x|(x, x*10)).collect();
     /// assert_eq!(map.len(), 8);
@@ -908,18 +1039,27 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// vec.sort_unstable();
     /// assert_eq!(vec, [(0, 0), (2, 20), (4, 40), (6, 60)]);
     /// ```
-    pub fn retain<F>(&mut self, mut f: F)
+    pub fn retain<F>(&self, mut f: F)
     where
         F: FnMut(&K, &mut V) -> bool,
+        V: Clone,
     {
         // Here we only use `iter` as a temporary, preventing use-after-free
         unsafe {
-            for item in self.table.iter() {
-                let &mut (ref key, ref mut value) = item.as_mut();
-                if !f(key, value) {
-                    self.table.erase(item);
+            self.table.rcu(|t| {
+                for item in t.iter() {
+                    let &mut (ref key, ref mut value) = item.as_mut();
+                    let mut retain = false;
+                    value.rcu(|v| {
+                        let mut value = v.deref().clone();
+                        retain = f(key, &mut value);
+                        value
+                    });
+                    if !retain {
+                        t.erase(item);
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -943,7 +1083,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<i32, i32> = (0..8).map(|x| (x, x)).collect();
     ///
@@ -967,7 +1107,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 8);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, K, V, F, A>
+    pub fn extract_if<F>(&self, f: F) -> ExtractIf<'_, K, V, F, A>
     where
         F: FnMut(&K, &mut V) -> bool,
     {
@@ -975,7 +1115,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
             f,
             inner: RawExtractIf {
                 iter: unsafe { self.table.iter() },
-                table: &mut self.table,
+                table: &self.table,
             },
         }
     }
@@ -986,7 +1126,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut a = HashMap::new();
     /// a.insert(1, "a");
@@ -1000,8 +1140,8 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// assert_eq!(a.capacity(), capacity_before_clear);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn clear(&mut self) {
-        self.table.clear();
+    pub fn clear(&self) {
+        self.table.rcu(|t| t.clear());
     }
 
     /// Creates a consuming iterator visiting all the keys in arbitrary order.
@@ -1011,7 +1151,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert("a", 1);
@@ -1039,7 +1179,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert("a", 1);
@@ -1061,11 +1201,11 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     }
 }
 
-impl<K, V, S, A> HashMap<K, V, S, A>
+impl<K: Clone, V, S, A> CowHashMap<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Reserves capacity for at least `additional` more elements to be inserted
     /// in the `HashMap`. The collection may reserve more space to avoid
@@ -1083,7 +1223,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     /// let mut map: HashMap<&str, i32> = HashMap::new();
     /// // Map is empty and doesn't allocate memory
     /// assert_eq!(map.capacity(), 0);
@@ -1094,9 +1234,13 @@ where
     /// assert!(map.capacity() >= 10);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn reserve(&mut self, additional: usize) {
-        self.table
-            .reserve(additional, make_hasher::<_, V, S>(&self.hash_builder));
+    pub fn reserve(&self, additional: usize) {
+        self.table.rcu(|t| {
+            t.reserve(
+                additional,
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder),
+            )
+        });
     }
 
     /// Tries to reserve capacity for at least `additional` more elements to be inserted
@@ -1111,7 +1255,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, isize> = HashMap::new();
     /// // Map is empty and doesn't allocate memory
@@ -1126,8 +1270,8 @@ where
     /// is returned:
     /// ```
     /// # fn test() {
-    /// use hashbrown::HashMap;
-    /// use hashbrown::TryReserveError;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::TryReserveError;
     /// let mut map: HashMap<i32, i32> = HashMap::new();
     ///
     /// match map.try_reserve(usize::MAX) {
@@ -1144,9 +1288,15 @@ where
     /// # }
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
+    pub fn try_reserve(&self, additional: usize) -> Result<(), TryReserveError> {
         self.table
-            .try_reserve(additional, make_hasher::<_, V, S>(&self.hash_builder))
+            .rcu(|t| {
+                t.try_reserve(
+                    additional,
+                    make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder),
+                )
+            })
+            .inner
     }
 
     /// Shrinks the capacity of the map as much as possible. It will drop
@@ -1156,7 +1306,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<i32, i32> = HashMap::with_capacity(100);
     /// map.insert(1, 2);
@@ -1166,9 +1316,9 @@ where
     /// assert!(map.capacity() >= 2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn shrink_to_fit(&mut self) {
+    pub fn shrink_to_fit(&self) {
         self.table
-            .shrink_to(0, make_hasher::<_, V, S>(&self.hash_builder));
+            .rcu(|t| t.shrink_to(0, make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder)));
     }
 
     /// Shrinks the capacity of the map with a lower limit. It will drop
@@ -1181,7 +1331,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<i32, i32> = HashMap::with_capacity(100);
     /// map.insert(1, 2);
@@ -1195,9 +1345,13 @@ where
     /// assert!(map.capacity() >= 2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn shrink_to(&mut self, min_capacity: usize) {
-        self.table
-            .shrink_to(min_capacity, make_hasher::<_, V, S>(&self.hash_builder));
+    pub fn shrink_to(&self, min_capacity: usize) {
+        self.table.rcu(|t| {
+            t.shrink_to(
+                min_capacity,
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder),
+            )
+        });
     }
 
     /// Gets the given key's corresponding entry in the map for in-place manipulation.
@@ -1205,7 +1359,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut letters = HashMap::new();
     ///
@@ -1220,13 +1374,19 @@ where
     /// assert_eq!(letters.get(&'y'), None);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, S, A> {
+    pub fn entry(&self, key: K) -> Entry<'_, '_, K, V, S, A> {
         let hash = make_hash::<K, S>(&self.hash_builder, &key);
-        if let Some(elem) = self.table.find(hash, equivalent_key(&key)) {
+
+        let lookup = self.table.map(|t| t.find(hash, equivalent_key(&key)));
+        if let Some(elem) = lookup.inner {
             Entry::Occupied(OccupiedEntry {
                 hash,
                 key: Some(key),
-                elem,
+                elem: RawTableGuard {
+                    guard: lookup.guard,
+                    inner: elem,
+                    _phantom: PhantomData,
+                },
                 table: self,
             })
         } else {
@@ -1243,7 +1403,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut words: HashMap<String, usize> = HashMap::new();
     /// let source = ["poneyland", "horseyland", "poneyland", "poneyland"];
@@ -1256,16 +1416,21 @@ where
     /// assert_eq!(words["horseyland"], 1);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn entry_ref<'a, 'b, Q>(&'a mut self, key: &'b Q) -> EntryRef<'a, 'b, K, Q, V, S, A>
+    pub fn entry_ref<'a, 'b, 'c, Q>(&'a mut self, key: &'b Q) -> EntryRef<'a, 'b, 'c, K, Q, V, S, A>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = make_hash::<Q, S>(&self.hash_builder, key);
-        if let Some(elem) = self.table.find(hash, equivalent_key(key)) {
+        let lookup = self.table.map(|t| t.find(hash, equivalent_key(key)));
+        if let Some(elem) = lookup.inner {
             EntryRef::Occupied(OccupiedEntryRef {
                 hash,
                 key: Some(KeyOrRef::Borrowed(key)),
-                elem,
+                elem: RawTableGuard {
+                    guard: lookup.guard,
+                    inner: elem,
+                    _phantom: PhantomData,
+                },
                 table: self,
             })
         } else {
@@ -1289,7 +1454,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, "a");
@@ -1297,15 +1462,12 @@ where
     /// assert_eq!(map.get(&2), None);
     /// ```
     #[inline]
-    pub fn get<Q>(&self, k: &Q) -> Option<&V>
+    pub fn get<Q>(&self, k: &Q) -> Option<Arc<V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        // Avoid `Option::map` because it bloats LLVM IR.
-        match self.get_inner(k) {
-            Some((_, v)) => Some(v),
-            None => None,
-        }
+        let inner = self.get_inner(k);
+        inner.inner.map(|(_, v)| v.load_full())
     }
 
     /// Returns the key-value pair corresponding to the supplied key.
@@ -1320,7 +1482,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, "a");
@@ -1328,28 +1490,30 @@ where
     /// assert_eq!(map.get_key_value(&2), None);
     /// ```
     #[inline]
-    pub fn get_key_value<Q>(&self, k: &Q) -> Option<(&K, &V)>
+    pub fn get_key_value<Q>(&self, k: &Q) -> Option<(&K, Arc<V>)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        // Avoid `Option::map` because it bloats LLVM IR.
-        match self.get_inner(k) {
-            Some((key, value)) => Some((key, value)),
-            None => None,
-        }
+        let inner = self.get_inner(k);
+        inner.inner.map(|(k, v)| (k, v.load_full()))
     }
 
     #[inline]
-    fn get_inner<Q>(&self, k: &Q) -> Option<&(K, V)>
+    fn get_inner<Q>(
+        &self,
+        k: &Q,
+    ) -> RawTableGuard<'_, (K, Arc<ArcSwap<V>>), A, Option<&(K, Arc<ArcSwap<V>>)>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        if self.table.is_empty() {
-            None
-        } else {
-            let hash = make_hash::<Q, S>(&self.hash_builder, k);
-            self.table.get(hash, equivalent_key(k))
-        }
+        self.table.map(|t| {
+            if t.is_empty() {
+                None
+            } else {
+                let hash = make_hash::<Q, S>(&self.hash_builder, k);
+                t.get(hash, equivalent_key(k))
+            }
+        })
     }
 
     /// Returns the key-value pair corresponding to the supplied key, with a mutable reference to value.
@@ -1364,7 +1528,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, "a");
@@ -1376,15 +1540,12 @@ where
     /// assert_eq!(map.get_key_value_mut(&2), None);
     /// ```
     #[inline]
-    pub fn get_key_value_mut<Q>(&mut self, k: &Q) -> Option<(&K, &mut V)>
+    pub fn get_key_value_mut<Q>(&self, k: &Q) -> Option<(&K, CowValueGuard<V>)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        // Avoid `Option::map` because it bloats LLVM IR.
-        match self.get_inner_mut(k) {
-            Some(&mut (ref key, ref mut value)) => Some((key, value)),
-            None => None,
-        }
+        let guard = self.get_inner(k);
+        guard.inner.map(|(k, v)| (k, CowValueGuard::new(v.clone())))
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -1399,7 +1560,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, "a");
@@ -1426,7 +1587,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, "a");
@@ -1438,276 +1599,12 @@ where
     /// assert_eq!(map.get_mut(&2), None);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut V>
+    pub fn get_mut<Q>(&self, k: &Q) -> Option<CowValueGuard<V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        // Avoid `Option::map` because it bloats LLVM IR.
-        match self.get_inner_mut(k) {
-            Some(&mut (_, ref mut v)) => Some(v),
-            None => None,
-        }
-    }
-
-    #[inline]
-    fn get_inner_mut<Q>(&mut self, k: &Q) -> Option<&mut (K, V)>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        if self.table.is_empty() {
-            None
-        } else {
-            let hash = make_hash::<Q, S>(&self.hash_builder, k);
-            self.table.get_mut(hash, equivalent_key(k))
-        }
-    }
-
-    /// Attempts to get mutable references to `N` values in the map at once.
-    ///
-    /// Returns an array of length `N` with the results of each query. For soundness, at most one
-    /// mutable reference will be returned to any value. `None` will be returned if any of the
-    /// keys are duplicates or missing.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use hashbrown::HashMap;
-    ///
-    /// let mut libraries = HashMap::new();
-    /// libraries.insert("Bodleian Library".to_string(), 1602);
-    /// libraries.insert("Athenæum".to_string(), 1807);
-    /// libraries.insert("Herzogin-Anna-Amalia-Bibliothek".to_string(), 1691);
-    /// libraries.insert("Library of Congress".to_string(), 1800);
-    ///
-    /// let got = libraries.get_many_mut([
-    ///     "Athenæum",
-    ///     "Library of Congress",
-    /// ]);
-    /// assert_eq!(
-    ///     got,
-    ///     Some([
-    ///         &mut 1807,
-    ///         &mut 1800,
-    ///     ]),
-    /// );
-    ///
-    /// // Missing keys result in None
-    /// let got = libraries.get_many_mut([
-    ///     "Athenæum",
-    ///     "New York Public Library",
-    /// ]);
-    /// assert_eq!(got, None);
-    ///
-    /// // Duplicate keys result in None
-    /// let got = libraries.get_many_mut([
-    ///     "Athenæum",
-    ///     "Athenæum",
-    /// ]);
-    /// assert_eq!(got, None);
-    /// ```
-    pub fn get_many_mut<Q, const N: usize>(&mut self, ks: [&Q; N]) -> Option<[&'_ mut V; N]>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        self.get_many_mut_inner(ks).map(|res| res.map(|(_, v)| v))
-    }
-
-    /// Attempts to get mutable references to `N` values in the map at once, without validating that
-    /// the values are unique.
-    ///
-    /// Returns an array of length `N` with the results of each query. `None` will be returned if
-    /// any of the keys are missing.
-    ///
-    /// For a safe alternative see [`get_many_mut`](`HashMap::get_many_mut`).
-    ///
-    /// # Safety
-    ///
-    /// Calling this method with overlapping keys is *[undefined behavior]* even if the resulting
-    /// references are not used.
-    ///
-    /// [undefined behavior]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use hashbrown::HashMap;
-    ///
-    /// let mut libraries = HashMap::new();
-    /// libraries.insert("Bodleian Library".to_string(), 1602);
-    /// libraries.insert("Athenæum".to_string(), 1807);
-    /// libraries.insert("Herzogin-Anna-Amalia-Bibliothek".to_string(), 1691);
-    /// libraries.insert("Library of Congress".to_string(), 1800);
-    ///
-    /// let got = libraries.get_many_mut([
-    ///     "Athenæum",
-    ///     "Library of Congress",
-    /// ]);
-    /// assert_eq!(
-    ///     got,
-    ///     Some([
-    ///         &mut 1807,
-    ///         &mut 1800,
-    ///     ]),
-    /// );
-    ///
-    /// // Missing keys result in None
-    /// let got = libraries.get_many_mut([
-    ///     "Athenæum",
-    ///     "New York Public Library",
-    /// ]);
-    /// assert_eq!(got, None);
-    /// ```
-    pub unsafe fn get_many_unchecked_mut<Q, const N: usize>(
-        &mut self,
-        ks: [&Q; N],
-    ) -> Option<[&'_ mut V; N]>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        self.get_many_unchecked_mut_inner(ks)
-            .map(|res| res.map(|(_, v)| v))
-    }
-
-    /// Attempts to get mutable references to `N` values in the map at once, with immutable
-    /// references to the corresponding keys.
-    ///
-    /// Returns an array of length `N` with the results of each query. For soundness, at most one
-    /// mutable reference will be returned to any value. `None` will be returned if any of the keys
-    /// are duplicates or missing.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use hashbrown::HashMap;
-    ///
-    /// let mut libraries = HashMap::new();
-    /// libraries.insert("Bodleian Library".to_string(), 1602);
-    /// libraries.insert("Athenæum".to_string(), 1807);
-    /// libraries.insert("Herzogin-Anna-Amalia-Bibliothek".to_string(), 1691);
-    /// libraries.insert("Library of Congress".to_string(), 1800);
-    ///
-    /// let got = libraries.get_many_key_value_mut([
-    ///     "Bodleian Library",
-    ///     "Herzogin-Anna-Amalia-Bibliothek",
-    /// ]);
-    /// assert_eq!(
-    ///     got,
-    ///     Some([
-    ///         (&"Bodleian Library".to_string(), &mut 1602),
-    ///         (&"Herzogin-Anna-Amalia-Bibliothek".to_string(), &mut 1691),
-    ///     ]),
-    /// );
-    /// // Missing keys result in None
-    /// let got = libraries.get_many_key_value_mut([
-    ///     "Bodleian Library",
-    ///     "Gewandhaus",
-    /// ]);
-    /// assert_eq!(got, None);
-    ///
-    /// // Duplicate keys result in None
-    /// let got = libraries.get_many_key_value_mut([
-    ///     "Bodleian Library",
-    ///     "Herzogin-Anna-Amalia-Bibliothek",
-    ///     "Herzogin-Anna-Amalia-Bibliothek",
-    /// ]);
-    /// assert_eq!(got, None);
-    /// ```
-    pub fn get_many_key_value_mut<Q, const N: usize>(
-        &mut self,
-        ks: [&Q; N],
-    ) -> Option<[(&'_ K, &'_ mut V); N]>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        self.get_many_mut_inner(ks)
-            .map(|res| res.map(|(k, v)| (&*k, v)))
-    }
-
-    /// Attempts to get mutable references to `N` values in the map at once, with immutable
-    /// references to the corresponding keys, without validating that the values are unique.
-    ///
-    /// Returns an array of length `N` with the results of each query. `None` will be returned if
-    /// any of the keys are missing.
-    ///
-    /// For a safe alternative see [`get_many_key_value_mut`](`HashMap::get_many_key_value_mut`).
-    ///
-    /// # Safety
-    ///
-    /// Calling this method with overlapping keys is *[undefined behavior]* even if the resulting
-    /// references are not used.
-    ///
-    /// [undefined behavior]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use hashbrown::HashMap;
-    ///
-    /// let mut libraries = HashMap::new();
-    /// libraries.insert("Bodleian Library".to_string(), 1602);
-    /// libraries.insert("Athenæum".to_string(), 1807);
-    /// libraries.insert("Herzogin-Anna-Amalia-Bibliothek".to_string(), 1691);
-    /// libraries.insert("Library of Congress".to_string(), 1800);
-    ///
-    /// let got = libraries.get_many_key_value_mut([
-    ///     "Bodleian Library",
-    ///     "Herzogin-Anna-Amalia-Bibliothek",
-    /// ]);
-    /// assert_eq!(
-    ///     got,
-    ///     Some([
-    ///         (&"Bodleian Library".to_string(), &mut 1602),
-    ///         (&"Herzogin-Anna-Amalia-Bibliothek".to_string(), &mut 1691),
-    ///     ]),
-    /// );
-    /// // Missing keys result in None
-    /// let got = libraries.get_many_key_value_mut([
-    ///     "Bodleian Library",
-    ///     "Gewandhaus",
-    /// ]);
-    /// assert_eq!(got, None);
-    /// ```
-    pub unsafe fn get_many_key_value_unchecked_mut<Q, const N: usize>(
-        &mut self,
-        ks: [&Q; N],
-    ) -> Option<[(&'_ K, &'_ mut V); N]>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        self.get_many_unchecked_mut_inner(ks)
-            .map(|res| res.map(|(k, v)| (&*k, v)))
-    }
-
-    fn get_many_mut_inner<Q, const N: usize>(&mut self, ks: [&Q; N]) -> Option<[&'_ mut (K, V); N]>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let hashes = self.build_hashes_inner(ks);
-        self.table
-            .get_many_mut(hashes, |i, (k, _)| ks[i].equivalent(k))
-    }
-
-    unsafe fn get_many_unchecked_mut_inner<Q, const N: usize>(
-        &mut self,
-        ks: [&Q; N],
-    ) -> Option<[&'_ mut (K, V); N]>
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let hashes = self.build_hashes_inner(ks);
-        self.table
-            .get_many_unchecked_mut(hashes, |i, (k, _)| ks[i].equivalent(k))
-    }
-
-    fn build_hashes_inner<Q, const N: usize>(&self, ks: [&Q; N]) -> [u64; N]
-    where
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let mut hashes = [0_u64; N];
-        for i in 0..N {
-            hashes[i] = make_hash::<Q, S>(&self.hash_builder, ks[i]);
-        }
-        hashes
+        let guard = self.get_inner(k);
+        guard.inner.map(|(_k, v)| CowValueGuard::new(v.clone()))
     }
 
     /// Inserts a key-value pair into the map.
@@ -1726,7 +1623,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// assert_eq!(map.insert(37, "a"), None);
@@ -1737,21 +1634,26 @@ where
     /// assert_eq!(map[&37], "c");
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(&mut self, k: K, v: V) -> Option<V> {
+    pub fn insert(&mut self, k: K, v: V) -> Option<CowValueGuard<V>> {
         let hash = make_hash::<K, S>(&self.hash_builder, &k);
-        let hasher = make_hasher::<_, V, S>(&self.hash_builder);
-        match self
+        let v = Arc::new(ArcSwap::new(Arc::new(v)));
+        let ret = self
             .table
-            .find_or_find_insert_slot(hash, equivalent_key(&k), hasher)
-        {
-            Ok(bucket) => Some(mem::replace(unsafe { &mut bucket.as_mut().1 }, v)),
-            Err(slot) => {
-                unsafe {
-                    self.table.insert_in_slot(hash, slot, (k, v));
+            .rcu(|t| {
+                let v = v.clone();
+                let hasher = make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder);
+                match t.find_or_find_insert_slot(hash, equivalent_key(&k), hasher) {
+                    Ok(bucket) => Some(mem::replace(unsafe { &mut bucket.as_mut().1 }, v)),
+                    Err(slot) => {
+                        unsafe {
+                            t.insert_in_slot(hash, slot, (k.clone(), v));
+                        }
+                        None
+                    }
                 }
-                None
-            }
-        }
+            })
+            .inner;
+        ret.map(|r| CowValueGuard::new(r))
     }
 
     /// Insert a key-value pair into the map without checking
@@ -1778,7 +1680,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map1 = HashMap::new();
     /// assert_eq!(map1.insert(1, "a"), None);
@@ -1804,13 +1706,18 @@ where
     /// assert_eq!(map2.len(), 4);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert_unique_unchecked(&mut self, k: K, v: V) -> (&K, &mut V) {
+    pub fn insert_unique_unchecked(&mut self, k: K, v: V) -> (&K, CowValueGuard<V>) {
         let hash = make_hash::<K, S>(&self.hash_builder, &k);
-        let bucket = self
-            .table
-            .insert(hash, (k, v), make_hasher::<_, V, S>(&self.hash_builder));
-        let (k_ref, v_ref) = unsafe { bucket.as_mut() };
-        (k_ref, v_ref)
+        let v = Arc::new(ArcSwap::new(Arc::new(v)));
+        let bucket = self.table.rcu(|t| {
+            t.insert(
+                hash,
+                (k.clone(), v.clone()),
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder),
+            )
+        });
+        let (k_ref, v_ref) = unsafe { bucket.as_ref() };
+        (k_ref, CowValueGuard::new(v_ref.clone()))
     }
 
     /// Tries to insert a key-value pair into the map, and returns
@@ -1826,8 +1733,8 @@ where
     /// Basic usage:
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::OccupiedError;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::OccupiedError;
     ///
     /// let mut map = HashMap::new();
     /// assert_eq!(map.try_insert(37, "a").unwrap(), &"a");
@@ -1846,7 +1753,7 @@ where
         &mut self,
         key: K,
         value: V,
-    ) -> Result<&mut V, OccupiedError<'_, K, V, S, A>> {
+    ) -> Result<CowValueGuard<V>, OccupiedError<'_, '_, K, V, S, A>> {
         match self.entry(key) {
             Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
             Entry::Vacant(entry) => Ok(entry.insert(value)),
@@ -1866,7 +1773,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// // The map is empty
@@ -1881,7 +1788,7 @@ where
     /// assert!(map.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove<Q>(&mut self, k: &Q) -> Option<V>
+    pub fn remove<Q>(&mut self, k: &Q) -> Option<Arc<V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
@@ -1905,7 +1812,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// // The map is empty
@@ -1920,16 +1827,20 @@ where
     /// assert!(map.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove_entry<Q>(&mut self, k: &Q) -> Option<(K, V)>
+    pub fn remove_entry<Q>(&mut self, k: &Q) -> Option<(K, Arc<V>)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = make_hash::<Q, S>(&self.hash_builder, k);
-        self.table.remove_entry(hash, equivalent_key(k))
+        let ret = self
+            .table
+            .rcu(|t| t.remove_entry(hash, equivalent_key(k)))
+            .inner?;
+        Some((ret.0, ret.1.load_full()))
     }
 }
 
-impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
+impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// Creates a raw entry builder for the HashMap.
     ///
     /// Raw entries provide the lowest level of control for searching and
@@ -1966,7 +1877,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     ///
     /// ```
     /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map = HashMap::new();
     /// map.extend([("a", 100), ("b", 200), ("c", 300)]);
@@ -2032,55 +1943,6 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
         RawEntryBuilderMut { map: self }
     }
 
-    /// Creates a raw immutable entry builder for the HashMap.
-    ///
-    /// Raw entries provide the lowest level of control for searching and
-    /// manipulating a map. They must be manually initialized with a hash and
-    /// then manually searched.
-    ///
-    /// This is useful for
-    /// * Hash memoization
-    /// * Using a search key that doesn't work with the Borrow trait
-    /// * Using custom comparison logic without newtype wrappers
-    ///
-    /// Unless you are in such a situation, higher-level and more foolproof APIs like
-    /// `get` should be preferred.
-    ///
-    /// Immutable raw entries have very limited use; you might instead want `raw_entry_mut`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::HashMap;
-    ///
-    /// let mut map = HashMap::new();
-    /// map.extend([("a", 100), ("b", 200), ("c", 300)]);
-    ///
-    /// fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &K) -> u64 {
-    ///     use core::hash::Hasher;
-    ///     let mut state = hash_builder.build_hasher();
-    ///     key.hash(&mut state);
-    ///     state.finish()
-    /// }
-    ///
-    /// for k in ["a", "b", "c", "d", "e", "f"] {
-    ///     let hash = compute_hash(map.hasher(), k);
-    ///     let v = map.get(&k).cloned();
-    ///     let kv = v.as_ref().map(|v| (&k, v));
-    ///
-    ///     println!("Key: {} and value: {:?}", k, v);
-    ///
-    ///     assert_eq!(map.raw_entry().from_key(&k), kv);
-    ///     assert_eq!(map.raw_entry().from_hash(hash, |q| *q == k), kv);
-    ///     assert_eq!(map.raw_entry().from_key_hashed_nocheck(hash, &k), kv);
-    /// }
-    /// ```
-    #[cfg_attr(feature = "inline-more", inline)]
-    pub fn raw_entry(&self) -> RawEntryBuilder<'_, K, V, S, A> {
-        RawEntryBuilder { map: self }
-    }
-
     /// Returns a reference to the [`RawTable`] used underneath [`HashMap`].
     /// This function is only available if the `raw` feature of the crate is enabled.
     ///
@@ -2112,7 +1974,7 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     ///
     /// ```
     /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.extend([("a", 10), ("b", 20), ("c", 30)]);
@@ -2155,54 +2017,28 @@ impl<K, V, S, A: Allocator> HashMap<K, V, S, A> {
     }
 }
 
-impl<K, V, S, A> PartialEq for HashMap<K, V, S, A>
-where
-    K: Eq + Hash,
-    V: PartialEq,
-    S: BuildHasher,
-    A: Allocator,
-{
-    fn eq(&self, other: &Self) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
-
-        self.iter()
-            .all(|(key, value)| other.get(key).map_or(false, |v| *value == *v))
-    }
-}
-
-impl<K, V, S, A> Eq for HashMap<K, V, S, A>
-where
-    K: Eq + Hash,
-    V: Eq,
-    S: BuildHasher,
-    A: Allocator,
-{
-}
-
-impl<K, V, S, A> Debug for HashMap<K, V, S, A>
+impl<K: Clone, V, S, A> Debug for CowHashMap<K, V, S, A>
 where
     K: Debug,
     V: Debug,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<K, V, S, A> Default for HashMap<K, V, S, A>
+impl<K: Clone, V, S, A> Default for CowHashMap<K, V, S, A>
 where
     S: Default,
-    A: Default + Allocator,
+    A: Default + Allocator + Clone,
 {
     /// Creates an empty `HashMap<K, V, S, A>`, with the `Default` value for the hasher and allocator.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     /// use std::collections::hash_map::RandomState;
     ///
     /// // You can specify all types of HashMap, including hasher and allocator.
@@ -2218,52 +2054,19 @@ where
     }
 }
 
-impl<K, Q, V, S, A> Index<&Q> for HashMap<K, V, S, A>
-where
-    K: Eq + Hash,
-    Q: Hash + Equivalent<K> + ?Sized,
-    S: BuildHasher,
-    A: Allocator,
-{
-    type Output = V;
-
-    /// Returns a reference to the value corresponding to the supplied key.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the key is not present in the `HashMap`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use hashbrown::HashMap;
-    ///
-    /// let map: HashMap<_, _> = [("a", "One"), ("b", "Two")].into();
-    ///
-    /// assert_eq!(map[&"a"], "One");
-    /// assert_eq!(map[&"b"], "Two");
-    /// ```
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn index(&self, key: &Q) -> &V {
-        self.get(key).expect("no entry found for key")
-    }
-}
-
 // The default hasher is used to match the std implementation signature
 #[cfg(feature = "default-hasher")]
-impl<K, V, A, const N: usize> From<[(K, V); N]> for HashMap<K, V, DefaultHashBuilder, A>
+impl<K: Clone, V, A, const N: usize> From<[(K, V); N]> for CowHashMap<K, V, DefaultHashBuilder, A>
 where
     K: Eq + Hash,
-    A: Default + Allocator,
+    A: Default + Allocator + Clone,
 {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
-    /// let map1 = HashMap::from([(1, 2), (3, 4)]);
     /// let map2: HashMap<_, _> = [(1, 2), (3, 4)].into();
-    /// assert_eq!(map1, map2);
     /// ```
     fn from(arr: [(K, V); N]) -> Self {
         arr.into_iter().collect()
@@ -2282,7 +2085,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// let map: HashMap<_, _> = [(1, "a"), (2, "b"), (3, "c")].into();
 ///
@@ -2298,25 +2101,25 @@ where
 /// assert_eq!(iter.next(), None);
 /// assert_eq!(iter.next(), None);
 /// ```
-pub struct Iter<'a, K, V> {
-    inner: RawIter<(K, V)>,
-    marker: PhantomData<(&'a K, &'a V)>,
+pub struct Iter<'a, K, V, A>
+where
+    A: Allocator + Clone,
+{
+    inner: CowRawIter<(K, Arc<ArcSwap<V>>), A>,
+    marker: PhantomData<(&'a K, &'a Arc<ArcSwap<V>>)>,
 }
 
 // FIXME(#26925) Remove in favor of `#[derive(Clone)]`
-impl<K, V> Clone for Iter<'_, K, V> {
+impl<K, V, A> Clone for Iter<'_, K, V, A>
+where
+    A: Allocator + Clone,
+{
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         Iter {
             inner: self.inner.clone(),
             marker: PhantomData,
         }
-    }
-}
-
-impl<K: Debug, V: Debug> fmt::Debug for Iter<'_, K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
     }
 }
 
@@ -2332,7 +2135,7 @@ impl<K: Debug, V: Debug> fmt::Debug for Iter<'_, K, V> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// let mut map: HashMap<_, _> = [(1, "One".to_owned()), (2, "Two".into())].into();
 ///
@@ -2344,11 +2147,14 @@ impl<K: Debug, V: Debug> fmt::Debug for Iter<'_, K, V> {
 /// assert_eq!(iter.next(), None);
 /// assert_eq!(iter.next(), None);
 ///
-/// assert_eq!(map.get(&1).unwrap(), &"One Mississippi".to_owned());
-/// assert_eq!(map.get(&2).unwrap(), &"Two Mississippi".to_owned());
+/// assert_eq!(map.get(&1).unwrap(), &Arc::new("One Mississippi".to_owned()));
+/// assert_eq!(map.get(&2).unwrap(), &Arc::new("Two Mississippi".to_owned()));
 /// ```
-pub struct IterMut<'a, K, V> {
-    inner: RawIter<(K, V)>,
+pub struct IterMut<'a, K, V, A>
+where
+    A: Allocator + Clone,
+{
+    inner: CowRawIter<(K, Arc<ArcSwap<V>>), A>,
     // To ensure invariance with respect to V
     marker: PhantomData<(&'a K, &'a mut V)>,
 }
@@ -2356,12 +2162,15 @@ pub struct IterMut<'a, K, V> {
 // We override the default Send impl which has K: Sync instead of K: Send. Both
 // are correct, but this one is more general since it allows keys which
 // implement Send but not Sync.
-unsafe impl<K: Send, V: Send> Send for IterMut<'_, K, V> {}
+unsafe impl<K: Send, V: Send, A> Send for IterMut<'_, K, V, A> where A: Allocator + Clone {}
 
-impl<K, V> IterMut<'_, K, V> {
+impl<K, V, A> IterMut<'_, K, V, A>
+where
+    A: Allocator + Clone,
+{
     /// Returns a iterator of references over the remaining items.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub(super) fn iter(&self) -> Iter<'_, K, V> {
+    pub(super) fn iter(&self) -> Iter<'_, K, V, A> {
         Iter {
             inner: self.inner.clone(),
             marker: PhantomData,
@@ -2383,7 +2192,7 @@ impl<K, V> IterMut<'_, K, V> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// let map: HashMap<_, _> = [(1, "a"), (2, "b"), (3, "c")].into();
 ///
@@ -2399,14 +2208,14 @@ impl<K, V> IterMut<'_, K, V> {
 /// assert_eq!(iter.next(), None);
 /// assert_eq!(iter.next(), None);
 /// ```
-pub struct IntoIter<K, V, A: Allocator = Global> {
-    inner: RawIntoIter<(K, V), A>,
+pub struct IntoIter<K, V, A: Allocator + Clone = Global> {
+    inner: CowRawIntoIter<(K, Arc<ArcSwap<V>>), A>,
 }
 
-impl<K, V, A: Allocator> IntoIter<K, V, A> {
+impl<K, V, A: Allocator + Clone> IntoIter<K, V, A> {
     /// Returns a iterator of references over the remaining items.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub(super) fn iter(&self) -> Iter<'_, K, V> {
+    pub(super) fn iter(&self) -> Iter<'_, K, V, A> {
         Iter {
             inner: self.inner.iter(),
             marker: PhantomData,
@@ -2427,7 +2236,7 @@ impl<K, V, A: Allocator> IntoIter<K, V, A> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// let map: HashMap<_, _> = [(1, "a"), (2, "b"), (3, "c")].into();
 ///
@@ -2443,11 +2252,11 @@ impl<K, V, A: Allocator> IntoIter<K, V, A> {
 /// assert_eq!(keys.next(), None);
 /// assert_eq!(keys.next(), None);
 /// ```
-pub struct IntoKeys<K, V, A: Allocator = Global> {
+pub struct IntoKeys<K: Clone, V, A: Allocator + Clone = Global> {
     inner: IntoIter<K, V, A>,
 }
 
-impl<K, V, A: Allocator> Iterator for IntoKeys<K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> Iterator for IntoKeys<K, V, A> {
     type Item = K;
 
     #[inline]
@@ -2468,22 +2277,14 @@ impl<K, V, A: Allocator> Iterator for IntoKeys<K, V, A> {
     }
 }
 
-impl<K, V, A: Allocator> ExactSizeIterator for IntoKeys<K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for IntoKeys<K, V, A> {
     #[inline]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 
-impl<K, V, A: Allocator> FusedIterator for IntoKeys<K, V, A> {}
-
-impl<K: Debug, V: Debug, A: Allocator> fmt::Debug for IntoKeys<K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(self.inner.iter().map(|(k, _)| k))
-            .finish()
-    }
-}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for IntoKeys<K, V, A> {}
 
 /// An owning iterator over the values of a `HashMap` in arbitrary order.
 /// The iterator element type is `V`.
@@ -2497,7 +2298,7 @@ impl<K: Debug, V: Debug, A: Allocator> fmt::Debug for IntoKeys<K, V, A> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// let map: HashMap<_, _> = [(1, "a"), (2, "b"), (3, "c")].into();
 ///
@@ -2513,15 +2314,15 @@ impl<K: Debug, V: Debug, A: Allocator> fmt::Debug for IntoKeys<K, V, A> {
 /// assert_eq!(values.next(), None);
 /// assert_eq!(values.next(), None);
 /// ```
-pub struct IntoValues<K, V, A: Allocator = Global> {
+pub struct IntoValues<K: Clone, V, A: Allocator + Clone = Global> {
     inner: IntoIter<K, V, A>,
 }
 
-impl<K, V, A: Allocator> Iterator for IntoValues<K, V, A> {
-    type Item = V;
+impl<K: Clone, V, A: Allocator + Clone> Iterator for IntoValues<K, V, A> {
+    type Item = Arc<V>;
 
     #[inline]
-    fn next(&mut self) -> Option<V> {
+    fn next(&mut self) -> Option<Arc<V>> {
         self.inner.next().map(|(_, v)| v)
     }
     #[inline]
@@ -2538,22 +2339,14 @@ impl<K, V, A: Allocator> Iterator for IntoValues<K, V, A> {
     }
 }
 
-impl<K, V, A: Allocator> ExactSizeIterator for IntoValues<K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for IntoValues<K, V, A> {
     #[inline]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 
-impl<K, V, A: Allocator> FusedIterator for IntoValues<K, V, A> {}
-
-impl<K, V: Debug, A: Allocator> fmt::Debug for IntoValues<K, V, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(self.inner.iter().map(|(_, v)| v))
-            .finish()
-    }
-}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for IntoValues<K, V, A> {}
 
 /// An iterator over the keys of a `HashMap` in arbitrary order.
 /// The iterator element type is `&'a K`.
@@ -2567,7 +2360,7 @@ impl<K, V: Debug, A: Allocator> fmt::Debug for IntoValues<K, V, A> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// let map: HashMap<_, _> = [(1, "a"), (2, "b"), (3, "c")].into();
 ///
@@ -2583,12 +2376,12 @@ impl<K, V: Debug, A: Allocator> fmt::Debug for IntoValues<K, V, A> {
 /// assert_eq!(keys.next(), None);
 /// assert_eq!(keys.next(), None);
 /// ```
-pub struct Keys<'a, K, V> {
-    inner: Iter<'a, K, V>,
+pub struct Keys<'a, K: Clone, V, A: Allocator + Clone> {
+    inner: Iter<'a, K, V, A>,
 }
 
 // FIXME(#26925) Remove in favor of `#[derive(Clone)]`
-impl<K, V> Clone for Keys<'_, K, V> {
+impl<K: Clone, V, A: Allocator + Clone> Clone for Keys<'_, K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         Keys {
@@ -2597,7 +2390,7 @@ impl<K, V> Clone for Keys<'_, K, V> {
     }
 }
 
-impl<K: Debug, V> fmt::Debug for Keys<'_, K, V> {
+impl<K: Debug + Clone, V, A: Allocator + Clone> fmt::Debug for Keys<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -2615,7 +2408,8 @@ impl<K: Debug, V> fmt::Debug for Keys<'_, K, V> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
+/// use std::sync::Arc;
 ///
 /// let map: HashMap<_, _> = [(1, "a"), (2, "b"), (3, "c")].into();
 ///
@@ -2625,18 +2419,18 @@ impl<K: Debug, V> fmt::Debug for Keys<'_, K, V> {
 /// // The `Values` iterator produces values in arbitrary order, so the
 /// // values must be sorted to test them against a sorted array.
 /// vec.sort_unstable();
-/// assert_eq!(vec, [Some(&"a"), Some(&"b"), Some(&"c")]);
+/// assert_eq!(vec, [Some(&Arc::new("a")), Some(&Arc::new("b")), Some(&Arc::new("c"))]);
 ///
 /// // It is fused iterator
 /// assert_eq!(values.next(), None);
 /// assert_eq!(values.next(), None);
 /// ```
-pub struct Values<'a, K, V> {
-    inner: Iter<'a, K, V>,
+pub struct Values<'a, K: Clone, V, A: Allocator + Clone> {
+    inner: Iter<'a, K, V, A>,
 }
 
 // FIXME(#26925) Remove in favor of `#[derive(Clone)]`
-impl<K, V> Clone for Values<'_, K, V> {
+impl<K: Clone, V, A: Allocator + Clone> Clone for Values<'_, K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         Values {
@@ -2645,7 +2439,7 @@ impl<K, V> Clone for Values<'_, K, V> {
     }
 }
 
-impl<K, V: Debug> fmt::Debug for Values<'_, K, V> {
+impl<K: Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for Values<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -2663,7 +2457,7 @@ impl<K, V: Debug> fmt::Debug for Values<'_, K, V> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// let mut map: HashMap<_, _> = [(1, "a"), (2, "b"), (3, "c")].into();
 ///
@@ -2679,16 +2473,19 @@ impl<K, V: Debug> fmt::Debug for Values<'_, K, V> {
 /// assert_eq!(drain_iter.next(), None);
 /// assert_eq!(drain_iter.next(), None);
 /// ```
-pub struct Drain<'a, K, V, A: Allocator = Global> {
-    inner: RawDrain<'a, (K, V), A>,
+pub struct Drain<'a, K: Clone, V, A: Allocator + Clone = Global> {
+    inner: RawTableGuard<'a, (K, Arc<ArcSwap<V>>), A, RawDrain<'a, (K, Arc<ArcSwap<V>>), A>>,
 }
 
-impl<K, V, A: Allocator> Drain<'_, K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> Drain<'_, K, V, A> {
     /// Returns a iterator of references over the remaining items.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub(super) fn iter(&self) -> Iter<'_, K, V> {
+    pub(super) fn iter(&self) -> Iter<'_, K, V, A> {
         Iter {
-            inner: self.inner.iter(),
+            inner: CowRawIter {
+                inner: self.inner.iter(),
+                guard: Guard::from_inner(self.inner.guard.clone()),
+            },
             marker: PhantomData,
         }
     }
@@ -2706,7 +2503,7 @@ impl<K, V, A: Allocator> Drain<'_, K, V, A> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
 ///
 /// let mut map: HashMap<i32, &str> = [(1, "a"), (2, "b"), (3, "c")].into();
 ///
@@ -2726,24 +2523,33 @@ impl<K, V, A: Allocator> Drain<'_, K, V, A> {
 /// assert_eq!(map.len(), 1);
 /// ```
 #[must_use = "Iterators are lazy unless consumed"]
-pub struct ExtractIf<'a, K, V, F, A: Allocator = Global>
+pub struct ExtractIf<'a, K: Clone, V, F, A: Allocator + Clone = Global>
 where
     F: FnMut(&K, &mut V) -> bool,
 {
     f: F,
-    inner: RawExtractIf<'a, (K, V), A>,
+    inner: RawExtractIf<'a, (K, Arc<ArcSwap<V>>), A>,
 }
 
-impl<K, V, F, A> Iterator for ExtractIf<'_, K, V, F, A>
+impl<K: Clone, V, F, A> Iterator for ExtractIf<'_, K, V, F, A>
 where
     F: FnMut(&K, &mut V) -> bool,
-    A: Allocator,
+    A: Allocator + Clone,
+    V: Clone,
 {
-    type Item = (K, V);
+    type Item = (K, Arc<ArcSwap<V>>);
 
     #[cfg_attr(feature = "inline-more", inline)]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next(|&mut (ref k, ref mut v)| (self.f)(k, v))
+        self.inner.next(|&mut (ref k, ref mut v)| {
+            let mut ret = false;
+            v.rcu(|v| {
+                let mut v = v.deref().clone();
+                ret = (self.f)(k, &mut v);
+                v
+            });
+            ret
+        })
     }
 
     #[inline]
@@ -2752,7 +2558,10 @@ where
     }
 }
 
-impl<K, V, F> FusedIterator for ExtractIf<'_, K, V, F> where F: FnMut(&K, &mut V) -> bool {}
+impl<K: Clone, V: Clone, F, A: Allocator + Clone> FusedIterator for ExtractIf<'_, K, V, F, A> where
+    F: FnMut(&K, &mut V) -> bool
+{
+}
 
 /// A mutable iterator over the values of a `HashMap` in arbitrary order.
 /// The iterator element type is `&'a mut V`.
@@ -2766,7 +2575,8 @@ impl<K, V, F> FusedIterator for ExtractIf<'_, K, V, F> where F: FnMut(&K, &mut V
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::CowHashMap as HashMap;
+/// use std::sync::Arc;
 ///
 /// let mut map: HashMap<_, _> = [(1, "One".to_owned()), (2, "Two".into())].into();
 ///
@@ -2778,11 +2588,11 @@ impl<K, V, F> FusedIterator for ExtractIf<'_, K, V, F> where F: FnMut(&K, &mut V
 /// assert_eq!(values.next(), None);
 /// assert_eq!(values.next(), None);
 ///
-/// assert_eq!(map.get(&1).unwrap(), &"One Mississippi".to_owned());
-/// assert_eq!(map.get(&2).unwrap(), &"Two Mississippi".to_owned());
+/// assert_eq!(map.get(&1).unwrap(), Arc::new("One Mississippi".to_owned()));
+/// assert_eq!(map.get(&2).unwrap(), Arc::new("Two Mississippi".to_owned()));
 /// ```
-pub struct ValuesMut<'a, K, V> {
-    inner: IterMut<'a, K, V>,
+pub struct ValuesMut<'a, K: Clone, V, A: Allocator + Clone> {
+    inner: IterMut<'a, K, V, A>,
 }
 
 /// A builder for computing where in a [`HashMap`] a key-value pair would be stored.
@@ -2794,8 +2604,8 @@ pub struct ValuesMut<'a, K, V> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_map::{RawEntryBuilderMut, RawEntryMut::Vacant, RawEntryMut::Occupied};
-/// use hashbrown::HashMap;
+/// use cow_hashbrown::hash_map::{RawEntryBuilderMut, RawEntryMut::Vacant, RawEntryMut::Occupied};
+/// use cow_hashbrown::CowHashMap as HashMap;
 /// use core::hash::{BuildHasher, Hash};
 ///
 /// let mut map = HashMap::new();
@@ -2840,8 +2650,9 @@ pub struct ValuesMut<'a, K, V> {
 ///
 /// assert_eq!(map.len(), 6);
 /// ```
-pub struct RawEntryBuilderMut<'a, K, V, S, A: Allocator = Global> {
-    map: &'a mut HashMap<K, V, S, A>,
+pub struct RawEntryBuilderMut<'a, K: Clone, V, S, A: Allocator + Clone = Global> {
+    #[allow(dead_code)]
+    map: &'a mut CowHashMap<K, V, S, A>,
 }
 
 /// A view into a single entry in a map, which may either be vacant or occupied.
@@ -2860,7 +2671,7 @@ pub struct RawEntryBuilderMut<'a, K, V, S, A: Allocator = Global> {
 ///
 /// ```
 /// use core::hash::{BuildHasher, Hash};
-/// use hashbrown::hash_map::{HashMap, RawEntryMut, RawOccupiedEntryMut};
+/// use cow_hashbrown::hash_map::{HashMap, RawEntryMut, RawOccupiedEntryMut};
 ///
 /// let mut map = HashMap::new();
 /// map.extend([('a', 1), ('b', 2), ('c', 3)]);
@@ -2928,13 +2739,13 @@ pub struct RawEntryBuilderMut<'a, K, V, S, A: Allocator = Global> {
 /// vec.sort_unstable();
 /// assert_eq!(vec, [('a', 10), ('b', 20), ('c', 30), ('d', 40), ('e', 50), ('f', 60)]);
 /// ```
-pub enum RawEntryMut<'a, K, V, S, A: Allocator = Global> {
+pub enum RawEntryMut<'a, K: Clone, V, S, A: Allocator + Clone = Global> {
     /// An occupied entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::{hash_map::RawEntryMut, HashMap};
+    /// use cow_hashbrown::{hash_map::RawEntryMut, HashMap};
     /// let mut map: HashMap<_, _> = [("a", 100), ("b", 200)].into();
     ///
     /// match map.raw_entry_mut().from_key(&"a") {
@@ -2948,7 +2759,7 @@ pub enum RawEntryMut<'a, K, V, S, A: Allocator = Global> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::{hash_map::RawEntryMut, HashMap};
+    /// use cow_hashbrown::{hash_map::RawEntryMut, HashMap};
     /// let mut map: HashMap<&str, i32> = HashMap::new();
     ///
     /// match map.raw_entry_mut().from_key("a") {
@@ -2968,7 +2779,7 @@ pub enum RawEntryMut<'a, K, V, S, A: Allocator = Global> {
 ///
 /// ```
 /// use core::hash::{BuildHasher, Hash};
-/// use hashbrown::hash_map::{HashMap, RawEntryMut, RawOccupiedEntryMut};
+/// use cow_hashbrown::hash_map::{HashMap, RawEntryMut, RawOccupiedEntryMut};
 ///
 /// let mut map = HashMap::new();
 /// map.extend([("a", 10), ("b", 20), ("c", 30)]);
@@ -3019,26 +2830,27 @@ pub enum RawEntryMut<'a, K, V, S, A: Allocator = Global> {
 /// assert_eq!(map.get(&"b"), None);
 /// assert_eq!(map.len(), 1);
 /// ```
-pub struct RawOccupiedEntryMut<'a, K, V, S, A: Allocator = Global> {
-    elem: Bucket<(K, V)>,
-    table: &'a mut RawTable<(K, V), A>,
+pub struct RawOccupiedEntryMut<'a, K: Clone, V, S, A: Allocator + Clone = Global> {
+    hash: u64,
+    elem: Bucket<(K, Arc<ArcSwap<V>>)>,
+    table: &'a mut CowRawTable<(K, Arc<ArcSwap<V>>), A>,
     hash_builder: &'a S,
 }
 
-unsafe impl<K, V, S, A> Send for RawOccupiedEntryMut<'_, K, V, S, A>
+unsafe impl<K: Clone, V, S, A> Send for RawOccupiedEntryMut<'_, K, V, S, A>
 where
     K: Send,
     V: Send,
     S: Send,
-    A: Send + Allocator,
+    A: Send + Allocator + Clone,
 {
 }
-unsafe impl<K, V, S, A> Sync for RawOccupiedEntryMut<'_, K, V, S, A>
+unsafe impl<K: Clone, V, S, A> Sync for RawOccupiedEntryMut<'_, K, V, S, A>
 where
     K: Sync,
     V: Sync,
     S: Sync,
-    A: Sync + Allocator,
+    A: Sync + Allocator + Clone,
 {
 }
 
@@ -3051,7 +2863,7 @@ where
 ///
 /// ```
 /// use core::hash::{BuildHasher, Hash};
-/// use hashbrown::hash_map::{HashMap, RawEntryMut, RawVacantEntryMut};
+/// use cow_hashbrown::hash_map::{HashMap, RawEntryMut, RawVacantEntryMut};
 ///
 /// let mut map = HashMap::<&str, i32>::new();
 ///
@@ -3090,257 +2902,18 @@ where
 /// }
 /// assert!(map[&"c"] == 30 && map.len() == 3);
 /// ```
-pub struct RawVacantEntryMut<'a, K, V, S, A: Allocator = Global> {
-    table: &'a mut RawTable<(K, V), A>,
+pub struct RawVacantEntryMut<'a, K: Clone, V, S, A: Allocator + Clone = Global> {
+    table: &'a mut CowRawTable<(K, Arc<ArcSwap<V>>), A>,
     hash_builder: &'a S,
 }
 
-/// A builder for computing where in a [`HashMap`] a key-value pair would be stored.
-///
-/// See the [`HashMap::raw_entry`] docs for usage examples.
-///
-/// [`HashMap::raw_entry`]: struct.HashMap.html#method.raw_entry
-///
-/// # Examples
-///
-/// ```
-/// use hashbrown::hash_map::{HashMap, RawEntryBuilder};
-/// use core::hash::{BuildHasher, Hash};
-///
-/// let mut map = HashMap::new();
-/// map.extend([(1, 10), (2, 20), (3, 30)]);
-///
-/// fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &K) -> u64 {
-///     use core::hash::Hasher;
-///     let mut state = hash_builder.build_hasher();
-///     key.hash(&mut state);
-///     state.finish()
-/// }
-///
-/// for k in 0..6 {
-///     let hash = compute_hash(map.hasher(), &k);
-///     let v = map.get(&k).cloned();
-///     let kv = v.as_ref().map(|v| (&k, v));
-///
-///     println!("Key: {} and value: {:?}", k, v);
-///     let builder: RawEntryBuilder<_, _, _> = map.raw_entry();
-///     assert_eq!(builder.from_key(&k), kv);
-///     assert_eq!(map.raw_entry().from_hash(hash, |q| *q == k), kv);
-///     assert_eq!(map.raw_entry().from_key_hashed_nocheck(hash, &k), kv);
-/// }
-/// ```
-pub struct RawEntryBuilder<'a, K, V, S, A: Allocator = Global> {
-    map: &'a HashMap<K, V, S, A>,
-}
-
-impl<'a, K, V, S, A: Allocator> RawEntryBuilderMut<'a, K, V, S, A> {
-    /// Creates a `RawEntryMut` from the given key.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
-    ///
-    /// let mut map: HashMap<&str, u32> = HashMap::new();
-    /// let key = "a";
-    /// let entry: RawEntryMut<&str, u32, _> = map.raw_entry_mut().from_key(&key);
-    /// entry.insert(key, 100);
-    /// assert_eq!(map[&"a"], 100);
-    /// ```
-    #[cfg_attr(feature = "inline-more", inline)]
-    #[allow(clippy::wrong_self_convention)]
-    pub fn from_key<Q>(self, k: &Q) -> RawEntryMut<'a, K, V, S, A>
-    where
-        S: BuildHasher,
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let hash = make_hash::<Q, S>(&self.map.hash_builder, k);
-        self.from_key_hashed_nocheck(hash, k)
-    }
-
-    /// Creates a `RawEntryMut` from the given key and its hash.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
-    ///
-    /// fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &K) -> u64 {
-    ///     use core::hash::Hasher;
-    ///     let mut state = hash_builder.build_hasher();
-    ///     key.hash(&mut state);
-    ///     state.finish()
-    /// }
-    ///
-    /// let mut map: HashMap<&str, u32> = HashMap::new();
-    /// let key = "a";
-    /// let hash = compute_hash(map.hasher(), &key);
-    /// let entry: RawEntryMut<&str, u32, _> = map.raw_entry_mut().from_key_hashed_nocheck(hash, &key);
-    /// entry.insert(key, 100);
-    /// assert_eq!(map[&"a"], 100);
-    /// ```
-    #[inline]
-    #[allow(clippy::wrong_self_convention)]
-    pub fn from_key_hashed_nocheck<Q>(self, hash: u64, k: &Q) -> RawEntryMut<'a, K, V, S, A>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        self.from_hash(hash, equivalent(k))
-    }
-}
-
-impl<'a, K, V, S, A: Allocator> RawEntryBuilderMut<'a, K, V, S, A> {
-    /// Creates a `RawEntryMut` from the given hash and matching function.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
-    ///
-    /// fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &K) -> u64 {
-    ///     use core::hash::Hasher;
-    ///     let mut state = hash_builder.build_hasher();
-    ///     key.hash(&mut state);
-    ///     state.finish()
-    /// }
-    ///
-    /// let mut map: HashMap<&str, u32> = HashMap::new();
-    /// let key = "a";
-    /// let hash = compute_hash(map.hasher(), &key);
-    /// let entry: RawEntryMut<&str, u32, _> = map.raw_entry_mut().from_hash(hash, |k| k == &key);
-    /// entry.insert(key, 100);
-    /// assert_eq!(map[&"a"], 100);
-    /// ```
-    #[cfg_attr(feature = "inline-more", inline)]
-    #[allow(clippy::wrong_self_convention)]
-    pub fn from_hash<F>(self, hash: u64, is_match: F) -> RawEntryMut<'a, K, V, S, A>
-    where
-        for<'b> F: FnMut(&'b K) -> bool,
-    {
-        self.search(hash, is_match)
-    }
-
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn search<F>(self, hash: u64, mut is_match: F) -> RawEntryMut<'a, K, V, S, A>
-    where
-        for<'b> F: FnMut(&'b K) -> bool,
-    {
-        match self.map.table.find(hash, |(k, _)| is_match(k)) {
-            Some(elem) => RawEntryMut::Occupied(RawOccupiedEntryMut {
-                elem,
-                table: &mut self.map.table,
-                hash_builder: &self.map.hash_builder,
-            }),
-            None => RawEntryMut::Vacant(RawVacantEntryMut {
-                table: &mut self.map.table,
-                hash_builder: &self.map.hash_builder,
-            }),
-        }
-    }
-}
-
-impl<'a, K, V, S, A: Allocator> RawEntryBuilder<'a, K, V, S, A> {
-    /// Access an immutable entry by key.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use hashbrown::HashMap;
-    ///
-    /// let map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
-    /// let key = "a";
-    /// assert_eq!(map.raw_entry().from_key(&key), Some((&"a", &100)));
-    /// ```
-    #[cfg_attr(feature = "inline-more", inline)]
-    #[allow(clippy::wrong_self_convention)]
-    pub fn from_key<Q>(self, k: &Q) -> Option<(&'a K, &'a V)>
-    where
-        S: BuildHasher,
-        Q: Hash + Equivalent<K> + ?Sized,
-    {
-        let hash = make_hash::<Q, S>(&self.map.hash_builder, k);
-        self.from_key_hashed_nocheck(hash, k)
-    }
-
-    /// Access an immutable entry by a key and its hash.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::HashMap;
-    ///
-    /// fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &K) -> u64 {
-    ///     use core::hash::Hasher;
-    ///     let mut state = hash_builder.build_hasher();
-    ///     key.hash(&mut state);
-    ///     state.finish()
-    /// }
-    ///
-    /// let map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
-    /// let key = "a";
-    /// let hash = compute_hash(map.hasher(), &key);
-    /// assert_eq!(map.raw_entry().from_key_hashed_nocheck(hash, &key), Some((&"a", &100)));
-    /// ```
-    #[cfg_attr(feature = "inline-more", inline)]
-    #[allow(clippy::wrong_self_convention)]
-    pub fn from_key_hashed_nocheck<Q>(self, hash: u64, k: &Q) -> Option<(&'a K, &'a V)>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        self.from_hash(hash, equivalent(k))
-    }
-
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn search<F>(self, hash: u64, mut is_match: F) -> Option<(&'a K, &'a V)>
-    where
-        F: FnMut(&K) -> bool,
-    {
-        match self.map.table.get(hash, |(k, _)| is_match(k)) {
-            Some((key, value)) => Some((key, value)),
-            None => None,
-        }
-    }
-
-    /// Access an immutable entry by hash and matching function.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::HashMap;
-    ///
-    /// fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &K) -> u64 {
-    ///     use core::hash::Hasher;
-    ///     let mut state = hash_builder.build_hasher();
-    ///     key.hash(&mut state);
-    ///     state.finish()
-    /// }
-    ///
-    /// let map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
-    /// let key = "a";
-    /// let hash = compute_hash(map.hasher(), &key);
-    /// assert_eq!(map.raw_entry().from_hash(hash, |k| k == &key), Some((&"a", &100)));
-    /// ```
-    #[cfg_attr(feature = "inline-more", inline)]
-    #[allow(clippy::wrong_self_convention)]
-    pub fn from_hash<F>(self, hash: u64, is_match: F) -> Option<(&'a K, &'a V)>
-    where
-        F: FnMut(&K) -> bool,
-    {
-        self.search(hash, is_match)
-    }
-}
-
-impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
+impl<'a, K: Clone, V, S, A: Allocator + Clone> RawEntryMut<'a, K, V, S, A> {
     /// Sets the value of the entry, and returns a RawOccupiedEntryMut.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// let entry = map.raw_entry_mut().from_key("horseyland").insert("horseyland", 37);
@@ -3368,7 +2941,7 @@ impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -3379,7 +2952,7 @@ impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert(self, default_key: K, default_val: V) -> (&'a mut K, &'a mut V)
+    pub fn or_insert(self, default_key: K, default_val: V) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
     where
         K: Hash,
         S: BuildHasher,
@@ -3396,7 +2969,7 @@ impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, String> = HashMap::new();
     ///
@@ -3407,7 +2980,7 @@ impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], "hoho".to_string());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with<F>(self, default: F) -> (&'a mut K, &'a mut V)
+    pub fn or_insert_with<F>(self, default: F) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
     where
         F: FnOnce() -> (K, V),
         K: Hash,
@@ -3428,7 +3001,7 @@ impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -3447,7 +3020,7 @@ impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn and_modify<F>(self, f: F) -> Self
     where
-        F: FnOnce(&mut K, &mut V),
+        F: FnOnce(&mut K, &mut Arc<ArcSwap<V>>),
     {
         match self {
             RawEntryMut::Occupied(mut entry) => {
@@ -3468,8 +3041,8 @@ impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::RawEntryMut;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::RawEntryMut;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -3519,7 +3092,8 @@ impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn and_replace_entry_with<F>(self, f: F) -> Self
     where
-        F: FnOnce(&K, V) -> Option<V>,
+        F: Fn(&K, &V) -> Option<V>,
+        K: Equivalent<K>,
     {
         match self {
             RawEntryMut::Occupied(entry) => entry.replace_entry_with(f),
@@ -3528,13 +3102,13 @@ impl<'a, K, V, S, A: Allocator> RawEntryMut<'a, K, V, S, A> {
     }
 }
 
-impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
+impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// Gets a reference to the key in the entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3553,7 +3127,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     /// use std::rc::Rc;
     ///
     /// let key_one = Rc::new("a");
@@ -3585,7 +3159,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     /// use std::rc::Rc;
     ///
     /// let key_one = Rc::new("a");
@@ -3618,7 +3192,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3628,7 +3202,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// }
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get(&self) -> &V {
+    pub fn get(&self) -> &Arc<ArcSwap<V>> {
         unsafe { &self.elem.as_ref().1 }
     }
 
@@ -3638,7 +3212,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3653,7 +3227,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map[&"a"], 1000);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_mut(self) -> &'a mut V {
+    pub fn into_mut(self) -> &'a mut Arc<ArcSwap<V>> {
         unsafe { &mut self.elem.as_mut().1 }
     }
 
@@ -3662,7 +3236,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3674,7 +3248,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map[&"a"], 1000);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_mut(&mut self) -> &mut V {
+    pub fn get_mut(&mut self) -> &mut Arc<ArcSwap<V>> {
         unsafe { &mut self.elem.as_mut().1 }
     }
 
@@ -3683,7 +3257,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3693,7 +3267,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// }
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_key_value(&self) -> (&K, &V) {
+    pub fn get_key_value(&self) -> (&K, &Arc<ArcSwap<V>>) {
         unsafe {
             let (key, value) = self.elem.as_ref();
             (key, value)
@@ -3705,7 +3279,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     /// use std::rc::Rc;
     ///
     /// let key_one = Rc::new("a");
@@ -3729,7 +3303,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// assert!(Rc::strong_count(&key_one) == 1 && Rc::strong_count(&key_two) == 2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_key_value_mut(&mut self) -> (&mut K, &mut V) {
+    pub fn get_key_value_mut(&mut self) -> (&mut K, &mut Arc<ArcSwap<V>>) {
         unsafe {
             let &mut (ref mut key, ref mut value) = self.elem.as_mut();
             (key, value)
@@ -3742,7 +3316,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     /// use std::rc::Rc;
     ///
     /// let key_one = Rc::new("a");
@@ -3770,7 +3344,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// assert!(Rc::strong_count(&key_one) == 1 && Rc::strong_count(&key_two) == 2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_key_value(self) -> (&'a mut K, &'a mut V) {
+    pub fn into_key_value(self) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>) {
         unsafe {
             let &mut (ref mut key, ref mut value) = self.elem.as_mut();
             (key, value)
@@ -3782,7 +3356,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3794,7 +3368,8 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map[&"a"], 1000);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(&mut self, value: V) -> V {
+    pub fn insert(&mut self, value: V) -> Arc<ArcSwap<V>> {
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
         mem::replace(self.get_mut(), value)
     }
 
@@ -3803,7 +3378,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     /// use std::rc::Rc;
     ///
     /// let key_one = Rc::new("a");
@@ -3835,7 +3410,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3846,8 +3421,11 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map.get(&"a"), None);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove(self) -> V {
-        self.remove_entry().1
+    pub fn remove(self) -> Arc<V>
+    where
+        K: Equivalent<K>,
+    {
+        self.remove_entry().1.load_full()
     }
 
     /// Take the ownership of the key and value from the map.
@@ -3855,7 +3433,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3866,8 +3444,21 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map.get(&"a"), None);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove_entry(self) -> (K, V) {
-        unsafe { self.table.remove(self.elem).0 }
+    pub fn remove_entry(self) -> (K, Arc<ArcSwap<V>>)
+    where
+        K: Equivalent<K>,
+    {
+        let ret = self
+            .table
+            .rcu(|t| unsafe {
+                let elem = t.find(self.hash, equivalent_key(self.key()));
+                if let Some(elem) = elem {
+                    t.remove(elem);
+                }
+                self.elem.as_ref()
+            })
+            .inner;
+        (ret.0.clone(), ret.1.clone())
     }
 
     /// Provides shared access to the key and owned access to the value of
@@ -3877,7 +3468,7 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3906,35 +3497,46 @@ impl<'a, K, V, S, A: Allocator> RawOccupiedEntryMut<'a, K, V, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn replace_entry_with<F>(self, f: F) -> RawEntryMut<'a, K, V, S, A>
     where
-        F: FnOnce(&K, V) -> Option<V>,
+        F: Fn(&K, &V) -> Option<V>,
+        K: Equivalent<K>,
     {
-        unsafe {
-            let still_occupied = self
-                .table
-                .replace_bucket_with(self.elem.clone(), |(key, value)| {
-                    f(&key, value).map(|new_value| (key, new_value))
-                });
-
-            if still_occupied {
-                RawEntryMut::Occupied(self)
-            } else {
-                RawEntryMut::Vacant(RawVacantEntryMut {
-                    table: self.table,
-                    hash_builder: self.hash_builder,
-                })
+        let elem = unsafe { self.elem.as_ref() };
+        let key = &elem.0;
+        let value = elem.1.load();
+        loop {
+            match f(&key, &value) {
+                Some(new) => {
+                    let prev = elem.1.compare_and_swap(&value, Arc::new(new));
+                    let swapped = ptr_eq(&value, &*prev);
+                    if swapped {
+                        return RawEntryMut::Occupied(self);
+                    }
+                }
+                None => {
+                    self.table.rcu(|t| unsafe {
+                        let elem = t.find(self.hash, equivalent_key(self.key()));
+                        if let Some(elem) = elem {
+                            t.remove(elem);
+                        }
+                    });
+                    return RawEntryMut::Vacant(RawVacantEntryMut {
+                        hash_builder: self.hash_builder,
+                        table: self.table,
+                    });
+                }
             }
         }
     }
 }
 
-impl<'a, K, V, S, A: Allocator> RawVacantEntryMut<'a, K, V, S, A> {
+impl<'a, K: Clone, V, S, A: Allocator + Clone> RawVacantEntryMut<'a, K, V, S, A> {
     /// Sets the value of the entry with the VacantEntry's key,
     /// and returns a mutable reference to it.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
     ///
@@ -3946,13 +3548,13 @@ impl<'a, K, V, S, A: Allocator> RawVacantEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map[&"c"], 300);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, key: K, value: V) -> (&'a mut K, &'a mut V)
+    pub fn insert(self, key: K, value: V) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
     where
         K: Hash,
         S: BuildHasher,
     {
         let hash = make_hash::<K, S>(self.hash_builder, &key);
-        self.insert_hashed_nocheck(hash, key, value)
+        self.insert_hashed_nocheck(hash, key, Arc::new(ArcSwap::new(Arc::new(value))))
     }
 
     /// Sets the value of the entry with the VacantEntry's key,
@@ -3962,7 +3564,7 @@ impl<'a, K, V, S, A: Allocator> RawVacantEntryMut<'a, K, V, S, A> {
     ///
     /// ```
     /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &K) -> u64 {
     ///     use core::hash::Hasher;
@@ -3987,16 +3589,26 @@ impl<'a, K, V, S, A: Allocator> RawVacantEntryMut<'a, K, V, S, A> {
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     #[allow(clippy::shadow_unrelated)]
-    pub fn insert_hashed_nocheck(self, hash: u64, key: K, value: V) -> (&'a mut K, &'a mut V)
+    pub fn insert_hashed_nocheck(
+        self,
+        hash: u64,
+        key: K,
+        value: Arc<ArcSwap<V>>,
+    ) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
     where
         K: Hash,
         S: BuildHasher,
     {
-        let &mut (ref mut k, ref mut v) = self.table.insert_entry(
-            hash,
-            (key, value),
-            make_hasher::<_, V, S>(self.hash_builder),
-        );
+        let &mut (ref mut k, ref mut v) = self
+            .table
+            .rcu(|t| {
+                t.insert_entry(
+                    hash,
+                    (key.clone(), value.clone()),
+                    make_hasher::<_, Arc<ArcSwap<V>>, S>(self.hash_builder),
+                )
+            })
+            .inner;
         (k, v)
     }
 
@@ -4006,7 +3618,7 @@ impl<'a, K, V, S, A: Allocator> RawVacantEntryMut<'a, K, V, S, A> {
     ///
     /// ```
     /// use core::hash::{BuildHasher, Hash};
-    /// use hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
     ///
     /// fn make_hasher<K, S>(hash_builder: &S) -> impl Fn(&K) -> u64 + '_
     /// where
@@ -4043,13 +3655,15 @@ impl<'a, K, V, S, A: Allocator> RawVacantEntryMut<'a, K, V, S, A> {
         key: K,
         value: V,
         hasher: H,
-    ) -> (&'a mut K, &'a mut V)
+    ) -> (&'a mut K, &'a mut Arc<ArcSwap<V>>)
     where
         H: Fn(&K) -> u64,
     {
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
         let &mut (ref mut k, ref mut v) = self
             .table
-            .insert_entry(hash, (key, value), |x| hasher(&x.0));
+            .rcu(|t| t.insert_entry(hash, (key.clone(), value.clone()), |x| hasher(&x.0)))
+            .inner;
         (k, v)
     }
 
@@ -4060,12 +3674,19 @@ impl<'a, K, V, S, A: Allocator> RawVacantEntryMut<'a, K, V, S, A> {
         S: BuildHasher,
     {
         let hash = make_hash::<K, S>(self.hash_builder, &key);
-        let elem = self.table.insert(
-            hash,
-            (key, value),
-            make_hasher::<_, V, S>(self.hash_builder),
-        );
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
+        let elem = self
+            .table
+            .rcu(|t| {
+                t.insert(
+                    hash,
+                    (key.clone(), value.clone()),
+                    make_hasher::<_, Arc<ArcSwap<V>>, S>(self.hash_builder),
+                )
+            })
+            .inner;
         RawOccupiedEntryMut {
+            hash,
             elem,
             table: self.table,
             hash_builder: self.hash_builder,
@@ -4073,13 +3694,15 @@ impl<'a, K, V, S, A: Allocator> RawVacantEntryMut<'a, K, V, S, A> {
     }
 }
 
-impl<K, V, S, A: Allocator> Debug for RawEntryBuilderMut<'_, K, V, S, A> {
+impl<K: Clone, V, S, A: Allocator + Clone> Debug for RawEntryBuilderMut<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RawEntryBuilder").finish()
     }
 }
 
-impl<K: Debug, V: Debug, S, A: Allocator> Debug for RawEntryMut<'_, K, V, S, A> {
+impl<K: Debug + Clone, V: Debug + Clone, S, A: Allocator + Clone> Debug
+    for RawEntryMut<'_, K, V, S, A>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             RawEntryMut::Vacant(ref v) => f.debug_tuple("RawEntry").field(v).finish(),
@@ -4088,7 +3711,9 @@ impl<K: Debug, V: Debug, S, A: Allocator> Debug for RawEntryMut<'_, K, V, S, A> 
     }
 }
 
-impl<K: Debug, V: Debug, S, A: Allocator> Debug for RawOccupiedEntryMut<'_, K, V, S, A> {
+impl<K: Debug + Clone, V: Debug + Clone, S, A: Allocator + Clone> Debug
+    for RawOccupiedEntryMut<'_, K, V, S, A>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RawOccupiedEntryMut")
             .field("key", self.key())
@@ -4097,15 +3722,9 @@ impl<K: Debug, V: Debug, S, A: Allocator> Debug for RawOccupiedEntryMut<'_, K, V
     }
 }
 
-impl<K, V, S, A: Allocator> Debug for RawVacantEntryMut<'_, K, V, S, A> {
+impl<K: Clone, V, S, A: Allocator + Clone> Debug for RawVacantEntryMut<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RawVacantEntryMut").finish()
-    }
-}
-
-impl<K, V, S, A: Allocator> Debug for RawEntryBuilder<'_, K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawEntryBuilder").finish()
     }
 }
 
@@ -4119,7 +3738,7 @@ impl<K, V, S, A: Allocator> Debug for RawEntryBuilder<'_, K, V, S, A> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_map::{Entry, HashMap, OccupiedEntry};
+/// use cow_hashbrown::hash_map::{Entry, HashMap, OccupiedEntry};
 ///
 /// let mut map = HashMap::new();
 /// map.extend([("a", 10), ("b", 20), ("c", 30)]);
@@ -4152,31 +3771,31 @@ impl<K, V, S, A: Allocator> Debug for RawEntryBuilder<'_, K, V, S, A> {
 /// vec.sort_unstable();
 /// assert_eq!(vec, [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5), ("f", 6)]);
 /// ```
-pub enum Entry<'a, K, V, S, A = Global>
+pub enum Entry<'a, 'b, K: Clone, V, S, A = Global>
 where
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// An occupied entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{Entry, HashMap};
-    /// let mut map: HashMap<_, _> = [("a", 100), ("b", 200)].into();
+    /// use cow_hashbrown::hash_map::{Entry, CowHashMap};
+    /// let mut map: CowHashMap<_, _> = [("a", 100), ("b", 200)].into();
     ///
     /// match map.entry("a") {
     ///     Entry::Vacant(_) => unreachable!(),
     ///     Entry::Occupied(_) => { }
     /// }
     /// ```
-    Occupied(OccupiedEntry<'a, K, V, S, A>),
+    Occupied(OccupiedEntry<'a, 'b, K, V, S, A>),
 
     /// A vacant entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{Entry, HashMap};
+    /// use cow_hashbrown::hash_map::{Entry, HashMap};
     /// let mut map: HashMap<&str, i32> = HashMap::new();
     ///
     /// match map.entry("a") {
@@ -4187,15 +3806,6 @@ where
     Vacant(VacantEntry<'a, K, V, S, A>),
 }
 
-impl<K: Debug, V: Debug, S, A: Allocator> Debug for Entry<'_, K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Entry::Vacant(ref v) => f.debug_tuple("Entry").field(v).finish(),
-            Entry::Occupied(ref o) => f.debug_tuple("Entry").field(o).finish(),
-        }
-    }
-}
-
 /// A view into an occupied entry in a `HashMap`.
 /// It is part of the [`Entry`] enum.
 ///
@@ -4204,7 +3814,7 @@ impl<K: Debug, V: Debug, S, A: Allocator> Debug for Entry<'_, K, V, S, A> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_map::{Entry, HashMap, OccupiedEntry};
+/// use cow_hashbrown::hash_map::{Entry, HashMap, OccupiedEntry};
 ///
 /// let mut map = HashMap::new();
 /// map.extend([("a", 10), ("b", 20), ("c", 30)]);
@@ -4236,37 +3846,29 @@ impl<K: Debug, V: Debug, S, A: Allocator> Debug for Entry<'_, K, V, S, A> {
 /// assert_eq!(map.get(&"c"), None);
 /// assert_eq!(map.len(), 2);
 /// ```
-pub struct OccupiedEntry<'a, K, V, S = DefaultHashBuilder, A: Allocator = Global> {
+pub struct OccupiedEntry<'a, 'b, K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global>
+{
     hash: u64,
     key: Option<K>,
-    elem: Bucket<(K, V)>,
-    table: &'a mut HashMap<K, V, S, A>,
+    elem: RawTableGuard<'b, (K, Arc<ArcSwap<V>>), A, Bucket<(K, Arc<ArcSwap<V>>)>>,
+    table: &'a CowHashMap<K, V, S, A>,
 }
 
-unsafe impl<K, V, S, A> Send for OccupiedEntry<'_, K, V, S, A>
+unsafe impl<K: Clone, V, S, A> Send for OccupiedEntry<'_, '_, K, V, S, A>
 where
     K: Send,
     V: Send,
     S: Send,
-    A: Send + Allocator,
+    A: Send + Allocator + Clone,
 {
 }
-unsafe impl<K, V, S, A> Sync for OccupiedEntry<'_, K, V, S, A>
+unsafe impl<K: Clone, V, S, A> Sync for OccupiedEntry<'_, '_, K, V, S, A>
 where
     K: Sync,
     V: Sync,
     S: Sync,
-    A: Sync + Allocator,
+    A: Sync + Allocator + Clone,
 {
-}
-
-impl<K: Debug, V: Debug, S, A: Allocator> Debug for OccupiedEntry<'_, K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OccupiedEntry")
-            .field("key", self.key())
-            .field("value", self.get())
-            .finish()
-    }
 }
 
 /// A view into a vacant entry in a `HashMap`.
@@ -4277,7 +3879,7 @@ impl<K: Debug, V: Debug, S, A: Allocator> Debug for OccupiedEntry<'_, K, V, S, A
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_map::{Entry, HashMap, VacantEntry};
+/// use cow_hashbrown::hash_map::{Entry, HashMap, VacantEntry};
 ///
 /// let mut map = HashMap::<&str, i32>::new();
 ///
@@ -4299,13 +3901,13 @@ impl<K: Debug, V: Debug, S, A: Allocator> Debug for OccupiedEntry<'_, K, V, S, A
 /// }
 /// assert!(map[&"b"] == 20 && map.len() == 2);
 /// ```
-pub struct VacantEntry<'a, K, V, S = DefaultHashBuilder, A: Allocator = Global> {
+pub struct VacantEntry<'a, K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     hash: u64,
     key: K,
-    table: &'a mut HashMap<K, V, S, A>,
+    table: &'a CowHashMap<K, V, S, A>,
 }
 
-impl<K: Debug, V, S, A: Allocator> Debug for VacantEntry<'_, K, V, S, A> {
+impl<K: Debug + Clone, V, S, A: Allocator + Clone> Debug for VacantEntry<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("VacantEntry").field(self.key()).finish()
     }
@@ -4330,7 +3932,7 @@ impl<K: Debug, V, S, A: Allocator> Debug for VacantEntry<'_, K, V, S, A> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_map::{EntryRef, HashMap, OccupiedEntryRef};
+/// use cow_hashbrown::hash_map::{EntryRef, HashMap, OccupiedEntryRef};
 ///
 /// let mut map = HashMap::new();
 /// map.extend([("a".to_owned(), 10), ("b".into(), 20), ("c".into(), 30)]);
@@ -4363,16 +3965,16 @@ impl<K: Debug, V, S, A: Allocator> Debug for VacantEntry<'_, K, V, S, A> {
 /// }
 /// assert_eq!(map.len(), 6);
 /// ```
-pub enum EntryRef<'a, 'b, K, Q: ?Sized, V, S, A = Global>
+pub enum EntryRef<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A = Global>
 where
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// An occupied entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{EntryRef, HashMap};
+    /// use cow_hashbrown::hash_map::{EntryRef, HashMap};
     /// let mut map: HashMap<_, _> = [("a".to_owned(), 100), ("b".into(), 200)].into();
     ///
     /// match map.entry_ref("a") {
@@ -4380,14 +3982,14 @@ where
     ///     EntryRef::Occupied(_) => { }
     /// }
     /// ```
-    Occupied(OccupiedEntryRef<'a, 'b, K, Q, V, S, A>),
+    Occupied(OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>),
 
     /// A vacant entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{EntryRef, HashMap};
+    /// use cow_hashbrown::hash_map::{EntryRef, HashMap};
     /// let mut map: HashMap<String, i32> = HashMap::new();
     ///
     /// match map.entry_ref("a") {
@@ -4398,12 +4000,12 @@ where
     Vacant(VacantEntryRef<'a, 'b, K, Q, V, S, A>),
 }
 
-impl<K, Q, V, S, A> Debug for EntryRef<'_, '_, K, Q, V, S, A>
+impl<K: Clone, Q, V, S, A> Debug for EntryRef<'_, '_, '_, K, Q, V, S, A>
 where
     K: Borrow<Q>,
     Q: Debug + ?Sized,
     V: Debug,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
@@ -4447,7 +4049,7 @@ impl<'a, K: Borrow<Q>, Q: ?Sized> AsRef<Q> for KeyOrRef<'a, K, Q> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_map::{EntryRef, HashMap, OccupiedEntryRef};
+/// use cow_hashbrown::hash_map::{EntryRef, HashMap, OccupiedEntryRef};
 ///
 /// let mut map = HashMap::new();
 /// map.extend([("a".to_owned(), 10), ("b".into(), 20), ("c".into(), 30)]);
@@ -4480,38 +4082,38 @@ impl<'a, K: Borrow<Q>, Q: ?Sized> AsRef<Q> for KeyOrRef<'a, K, Q> {
 /// assert_eq!(map.get("c"), None);
 /// assert_eq!(map.len(), 2);
 /// ```
-pub struct OccupiedEntryRef<'a, 'b, K, Q: ?Sized, V, S, A: Allocator = Global> {
+pub struct OccupiedEntryRef<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone = Global> {
     hash: u64,
     key: Option<KeyOrRef<'b, K, Q>>,
-    elem: Bucket<(K, V)>,
-    table: &'a mut HashMap<K, V, S, A>,
+    elem: RawTableGuard<'c, (K, Arc<ArcSwap<V>>), A, Bucket<(K, Arc<ArcSwap<V>>)>>,
+    table: &'a CowHashMap<K, V, S, A>,
 }
 
-unsafe impl<'a, 'b, K, Q, V, S, A> Send for OccupiedEntryRef<'a, 'b, K, Q, V, S, A>
+unsafe impl<'a, 'b, 'c, K: Clone, Q, V, S, A> Send for OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
 where
     K: Send,
     Q: Sync + ?Sized,
     V: Send,
     S: Send,
-    A: Send + Allocator,
+    A: Send + Allocator + Clone,
 {
 }
-unsafe impl<'a, 'b, K, Q, V, S, A> Sync for OccupiedEntryRef<'a, 'b, K, Q, V, S, A>
+unsafe impl<'a, 'b, 'c, K: Clone, Q, V, S, A> Sync for OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
 where
     K: Sync,
     Q: Sync + ?Sized,
     V: Sync,
     S: Sync,
-    A: Sync + Allocator,
+    A: Sync + Allocator + Clone,
 {
 }
 
-impl<K, Q, V, S, A> Debug for OccupiedEntryRef<'_, '_, K, Q, V, S, A>
+impl<K: Clone, Q, V, S, A> Debug for OccupiedEntryRef<'_, '_, '_, K, Q, V, S, A>
 where
     K: Borrow<Q>,
     Q: Debug + ?Sized,
     V: Debug,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OccupiedEntryRef")
@@ -4529,9 +4131,9 @@ where
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_map::{EntryRef, HashMap, VacantEntryRef};
+/// use cow_hashbrown::hash_map::{EntryRef, CowHashMap, VacantEntryRef};
 ///
-/// let mut map = HashMap::<String, i32>::new();
+/// let mut map = CowHashMap::<String, i32>::new();
 ///
 /// let entry_v: VacantEntryRef<_, _, _, _> = match map.entry_ref("a") {
 ///     EntryRef::Vacant(view) => view,
@@ -4551,17 +4153,17 @@ where
 /// }
 /// assert!(map["b"] == 20 && map.len() == 2);
 /// ```
-pub struct VacantEntryRef<'a, 'b, K, Q: ?Sized, V, S, A: Allocator = Global> {
+pub struct VacantEntryRef<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone = Global> {
     hash: u64,
     key: KeyOrRef<'b, K, Q>,
-    table: &'a mut HashMap<K, V, S, A>,
+    table: &'a CowHashMap<K, V, S, A>,
 }
 
-impl<K, Q, V, S, A> Debug for VacantEntryRef<'_, '_, K, Q, V, S, A>
+impl<K: Clone, Q, V, S, A> Debug for VacantEntryRef<'_, '_, K, Q, V, S, A>
 where
     K: Borrow<Q>,
     Q: Debug + ?Sized,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("VacantEntryRef").field(&self.key()).finish()
@@ -4575,7 +4177,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_map::{HashMap, OccupiedError};
+/// use cow_hashbrown::hash_map::{HashMap, OccupiedError};
 ///
 /// let mut map: HashMap<_, _> = [("a", 10), ("b", 20)].into();
 ///
@@ -4592,38 +4194,16 @@ where
 /// }
 /// assert_eq!(map[&"a"], 100);
 /// ```
-pub struct OccupiedError<'a, K, V, S, A: Allocator = Global> {
+pub struct OccupiedError<'a, 'b, K: Clone, V, S, A: Allocator + Clone = Global> {
     /// The entry in the map that was already occupied.
-    pub entry: OccupiedEntry<'a, K, V, S, A>,
+    pub entry: OccupiedEntry<'a, 'b, K, V, S, A>,
     /// The value which was not inserted, because the entry was already occupied.
     pub value: V,
 }
 
-impl<K: Debug, V: Debug, S, A: Allocator> Debug for OccupiedError<'_, K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OccupiedError")
-            .field("key", self.entry.key())
-            .field("old_value", self.entry.get())
-            .field("new_value", &self.value)
-            .finish()
-    }
-}
-
-impl<'a, K: Debug, V: Debug, S, A: Allocator> fmt::Display for OccupiedError<'a, K, V, S, A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "failed to insert {:?}, key {:?} already exists with value {:?}",
-            self.value,
-            self.entry.key(),
-            self.entry.get(),
-        )
-    }
-}
-
-impl<'a, K, V, S, A: Allocator> IntoIterator for &'a HashMap<K, V, S, A> {
-    type Item = (&'a K, &'a V);
-    type IntoIter = Iter<'a, K, V>;
+impl<'a, K: Clone, V, S, A: Allocator + Clone> IntoIterator for &'a CowHashMap<K, V, S, A> {
+    type Item = (&'a K, Arc<V>);
+    type IntoIter = Iter<'a, K, V, A>;
 
     /// Creates an iterator over the entries of a `HashMap` in arbitrary order.
     /// The iterator element type is `(&'a K, &'a V)`.
@@ -4636,26 +4216,24 @@ impl<'a, K, V, S, A: Allocator> IntoIterator for &'a HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     /// let map_one: HashMap<_, _> = [(1, "a"), (2, "b"), (3, "c")].into();
     /// let mut map_two = HashMap::new();
     ///
     /// for (key, value) in &map_one {
-    ///     println!("Key: {}, Value: {}", key, value);
+    ///     println!("Key: {}", key);
     ///     map_two.insert_unique_unchecked(*key, *value);
     /// }
-    ///
-    /// assert_eq!(map_one, map_two);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    fn into_iter(self) -> Iter<'a, K, V> {
+    fn into_iter(self) -> Iter<'a, K, V, A> {
         self.iter()
     }
 }
 
-impl<'a, K, V, S, A: Allocator> IntoIterator for &'a mut HashMap<K, V, S, A> {
-    type Item = (&'a K, &'a mut V);
-    type IntoIter = IterMut<'a, K, V>;
+impl<'a, K: Clone, V, S, A: Allocator + Clone> IntoIterator for &'a mut CowHashMap<K, V, S, A> {
+    type Item = (&'a K, CowValueGuard<V>);
+    type IntoIter = IterMut<'a, K, V, A>;
 
     /// Creates an iterator over the entries of a `HashMap` in arbitrary order
     /// with mutable references to the values. The iterator element type is
@@ -4670,11 +4248,12 @@ impl<'a, K, V, S, A: Allocator> IntoIterator for &'a mut HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use std::sync::Arc;
     /// let mut map: HashMap<_, _> = [("a", 1), ("b", 2), ("c", 3)].into();
     ///
     /// for (key, value) in &mut map {
-    ///     println!("Key: {}, Value: {}", key, value);
+    ///     println!("Key: {}, Value: {}", key, &value);
     ///     *value *= 2;
     /// }
     ///
@@ -4682,16 +4261,16 @@ impl<'a, K, V, S, A: Allocator> IntoIterator for &'a mut HashMap<K, V, S, A> {
     /// // The `Iter` iterator produces items in arbitrary order, so the
     /// // items must be sorted to test them against a sorted array.
     /// vec.sort_unstable();
-    /// assert_eq!(vec, [(&"a", &2), (&"b", &4), (&"c", &6)]);
+    /// assert_eq!(vec, [(&"a", Arc::new(2)), (&"b", Arc::new(4)), (&"c", Arc::new(6))]);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    fn into_iter(self) -> IterMut<'a, K, V> {
+    fn into_iter(self) -> IterMut<'a, K, V, A> {
         self.iter_mut()
     }
 }
 
-impl<K, V, S, A: Allocator> IntoIterator for HashMap<K, V, S, A> {
-    type Item = (K, V);
+impl<K: Clone, V, S, A: Allocator + Clone> IntoIterator for CowHashMap<K, V, S, A> {
+    type Item = (K, Arc<V>);
     type IntoIter = IntoIter<K, V, A>;
 
     /// Creates a consuming iterator, that is, one that moves each key-value
@@ -4701,7 +4280,7 @@ impl<K, V, S, A: Allocator> IntoIterator for HashMap<K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let map: HashMap<_, _> = [("a", 1), ("b", 2), ("c", 3)].into();
     ///
@@ -4720,16 +4299,19 @@ impl<K, V, S, A: Allocator> IntoIterator for HashMap<K, V, S, A> {
     }
 }
 
-impl<'a, K, V> Iterator for Iter<'a, K, V> {
-    type Item = (&'a K, &'a V);
+impl<'a, K: Clone, V, A> Iterator for Iter<'a, K, V, A>
+where
+    A: Allocator + Clone,
+{
+    type Item = (&'a K, Arc<V>);
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<(&'a K, &'a V)> {
+    fn next(&mut self) -> Option<(&'a K, Arc<V>)> {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.inner.next() {
             Some(x) => unsafe {
                 let r = x.as_ref();
-                Some((&r.0, &r.1))
+                Some((&r.0, r.1.load_full()))
             },
             None => None,
         }
@@ -4738,37 +4320,32 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn fold<B, F>(self, init: B, mut f: F) -> B
-    where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
-    {
-        self.inner.fold(init, |acc, x| unsafe {
-            let (k, v) = x.as_ref();
-            f(acc, (k, v))
-        })
-    }
 }
-impl<K, V> ExactSizeIterator for Iter<'_, K, V> {
+impl<K: Clone, V, A> ExactSizeIterator for Iter<'_, K, V, A>
+where
+    A: Allocator + Clone,
+{
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 
-impl<K, V> FusedIterator for Iter<'_, K, V> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Iter<'_, K, V, A> {}
 
-impl<'a, K, V> Iterator for IterMut<'a, K, V> {
-    type Item = (&'a K, &'a mut V);
+impl<'a, K: Clone, V, A> Iterator for IterMut<'a, K, V, A>
+where
+    A: Allocator + Clone,
+{
+    type Item = (&'a K, CowValueGuard<V>);
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
+    fn next(&mut self) -> Option<(&'a K, CowValueGuard<V>)> {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.inner.next() {
             Some(x) => unsafe {
                 let r = x.as_mut();
-                Some((&r.0, &mut r.1))
+                Some((&r.0, CowValueGuard::new(r.1.clone())))
             },
             None => None,
         }
@@ -4777,71 +4354,62 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn fold<B, F>(self, init: B, mut f: F) -> B
-    where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
-    {
-        self.inner.fold(init, |acc, x| unsafe {
-            let (k, v) = x.as_mut();
-            f(acc, (k, v))
-        })
-    }
 }
-impl<K, V> ExactSizeIterator for IterMut<'_, K, V> {
+impl<K: Clone, V, A> ExactSizeIterator for IterMut<'_, K, V, A>
+where
+    A: Allocator + Clone,
+{
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K, V> FusedIterator for IterMut<'_, K, V> {}
+impl<K: Clone, V, A> FusedIterator for IterMut<'_, K, V, A> where A: Allocator + Clone {}
 
-impl<K, V> fmt::Debug for IterMut<'_, K, V>
+impl<K, V, A> fmt::Debug for IterMut<'_, K, V, A>
 where
-    K: fmt::Debug,
-    V: fmt::Debug,
+    K: fmt::Debug + Clone,
+    V: fmt::Debug + Clone,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl<K, V, A: Allocator> Iterator for IntoIter<K, V, A> {
-    type Item = (K, V);
+impl<K: Clone, V, A: Allocator + Clone> Iterator for IntoIter<K, V, A> {
+    type Item = (K, Arc<V>);
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<(K, V)> {
-        self.inner.next()
+    fn next(&mut self) -> Option<(K, Arc<V>)> {
+        match self.inner.next() {
+            Some(x) => unsafe {
+                let r = x.as_mut();
+                Some((r.0.clone(), r.1.load_full()))
+            },
+            None => None,
+        }
     }
     #[cfg_attr(feature = "inline-more", inline)]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn fold<B, F>(self, init: B, f: F) -> B
-    where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
-    {
-        self.inner.fold(init, f)
-    }
 }
-impl<K, V, A: Allocator> ExactSizeIterator for IntoIter<K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for IntoIter<K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K, V, A: Allocator> FusedIterator for IntoIter<K, V, A> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for IntoIter<K, V, A> {}
 
-impl<K: Debug, V: Debug, A: Allocator> fmt::Debug for IntoIter<K, V, A> {
+impl<K: Debug + Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for IntoIter<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl<'a, K, V> Iterator for Keys<'a, K, V> {
+impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Keys<'a, K, V, A> {
     type Item = &'a K;
 
     #[cfg_attr(feature = "inline-more", inline)]
@@ -4865,19 +4433,42 @@ impl<'a, K, V> Iterator for Keys<'a, K, V> {
         self.inner.fold(init, |acc, (k, _)| f(acc, k))
     }
 }
-impl<K, V> ExactSizeIterator for Keys<'_, K, V> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Keys<'_, K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K, V> FusedIterator for Keys<'_, K, V> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Keys<'_, K, V, A> {}
 
-impl<'a, K, V> Iterator for Values<'a, K, V> {
-    type Item = &'a V;
+impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Values<'a, K, V, A> {
+    type Item = Arc<V>;
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<&'a V> {
+    fn next(&mut self) -> Option<Arc<V>> {
+        match self.inner.next() {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
+    }
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Values<'_, K, V, A> {
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Values<'_, K, V, A> {}
+
+impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for ValuesMut<'a, K, V, A> {
+    type Item = CowValueGuard<V>;
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn next(&mut self) -> Option<CowValueGuard<V>> {
         // Avoid `Option::map` because it bloats LLVM IR.
         match self.inner.next() {
             Some((_, v)) => Some(v),
@@ -4888,56 +4479,16 @@ impl<'a, K, V> Iterator for Values<'a, K, V> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn fold<B, F>(self, init: B, mut f: F) -> B
-    where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
-    {
-        self.inner.fold(init, |acc, (_, v)| f(acc, v))
-    }
 }
-impl<K, V> ExactSizeIterator for Values<'_, K, V> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for ValuesMut<'_, K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K, V> FusedIterator for Values<'_, K, V> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for ValuesMut<'_, K, V, A> {}
 
-impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
-    type Item = &'a mut V;
-
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<&'a mut V> {
-        // Avoid `Option::map` because it bloats LLVM IR.
-        match self.inner.next() {
-            Some((_, v)) => Some(v),
-            None => None,
-        }
-    }
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn fold<B, F>(self, init: B, mut f: F) -> B
-    where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
-    {
-        self.inner.fold(init, |acc, (_, v)| f(acc, v))
-    }
-}
-impl<K, V> ExactSizeIterator for ValuesMut<'_, K, V> {
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-impl<K, V> FusedIterator for ValuesMut<'_, K, V> {}
-
-impl<K, V: Debug> fmt::Debug for ValuesMut<'_, K, V> {
+impl<K: Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for ValuesMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list()
             .entries(self.inner.iter().map(|(_, val)| val))
@@ -4945,52 +4496,44 @@ impl<K, V: Debug> fmt::Debug for ValuesMut<'_, K, V> {
     }
 }
 
-impl<'a, K, V, A: Allocator> Iterator for Drain<'a, K, V, A> {
-    type Item = (K, V);
+impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Drain<'a, K, V, A> {
+    type Item = (K, Arc<V>);
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<(K, V)> {
-        self.inner.next()
+    fn next(&mut self) -> Option<(K, Arc<V>)> {
+        self.inner.inner.next().map(|(k, v)| (k, v.load_full()))
     }
     #[cfg_attr(feature = "inline-more", inline)]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn fold<B, F>(self, init: B, f: F) -> B
-    where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
-    {
-        self.inner.fold(init, f)
-    }
 }
-impl<K, V, A: Allocator> ExactSizeIterator for Drain<'_, K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Drain<'_, K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K, V, A: Allocator> FusedIterator for Drain<'_, K, V, A> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Drain<'_, K, V, A> {}
 
-impl<K, V, A> fmt::Debug for Drain<'_, K, V, A>
+impl<K: Clone, V, A> fmt::Debug for Drain<'_, K, V, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
+impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> Entry<'a, 'b, K, V, S, A> {
     /// Sets the value of the entry, and returns an OccupiedEntry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// let entry = map.entry("horseyland").insert(37);
@@ -4998,13 +4541,16 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// assert_eq!(entry.key(), &"horseyland");
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, value: V) -> OccupiedEntry<'a, K, V, S, A>
+    pub fn insert(self, value: V) -> OccupiedEntry<'a, 'b, K, V, S, A>
     where
         K: Hash,
         S: BuildHasher,
+        K: 'b,
+        V: 'b,
+        A: 'b,
     {
         match self {
-            Entry::Occupied(mut entry) => {
+            Entry::Occupied(entry) => {
                 entry.insert(value);
                 entry
             }
@@ -5018,7 +4564,7 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -5031,7 +4577,7 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert(self, default: V) -> &'a mut V
+    pub fn or_insert(self, default: V) -> CowValueGuard<V>
     where
         K: Hash,
         S: BuildHasher,
@@ -5048,7 +4594,7 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -5061,7 +4607,7 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> CowValueGuard<V>
     where
         K: Hash,
         S: BuildHasher,
@@ -5082,7 +4628,7 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, usize> = HashMap::new();
     ///
@@ -5095,7 +4641,7 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 18);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> &'a mut V
+    pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> CowValueGuard<V>
     where
         K: Hash,
         S: BuildHasher,
@@ -5114,7 +4660,7 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.entry("poneyland").or_insert(3);
@@ -5137,7 +4683,7 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -5154,11 +4700,17 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn and_modify<F>(self, f: F) -> Self
     where
-        F: FnOnce(&mut V),
+        F: Fn(&mut V),
+        V: Clone,
     {
         match self {
-            Entry::Occupied(mut entry) => {
-                f(entry.get_mut());
+            Entry::Occupied(entry) => {
+                let v = unsafe { &entry.elem.as_ref().1.clone() };
+                v.rcu(|v| {
+                    let mut v = v.deref().clone();
+                    f(&mut v);
+                    v
+                });
                 Entry::Occupied(entry)
             }
             Entry::Vacant(entry) => Entry::Vacant(entry),
@@ -5172,8 +4724,8 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::Entry;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::Entry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -5222,7 +4774,8 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn and_replace_entry_with<F>(self, f: F) -> Self
     where
-        F: FnOnce(&K, V) -> Option<V>,
+        F: Fn(&K, &V) -> Option<V>,
+        K: Equivalent<K>,
     {
         match self {
             Entry::Occupied(entry) => entry.replace_entry_with(f),
@@ -5231,14 +4784,14 @@ impl<'a, K, V, S, A: Allocator> Entry<'a, K, V, S, A> {
     }
 }
 
-impl<'a, K, V: Default, S, A: Allocator> Entry<'a, K, V, S, A> {
+impl<'a, 'b, K: Clone, V: Default + Clone, S, A: Allocator + Clone> Entry<'a, 'b, K, V, S, A> {
     /// Ensures a value is in the entry by inserting the default value if empty,
     /// and returns a mutable reference to the value in the entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, Option<u32>> = HashMap::new();
     ///
@@ -5252,7 +4805,7 @@ impl<'a, K, V: Default, S, A: Allocator> Entry<'a, K, V, S, A> {
     /// assert_eq!(map.entry("horseland").or_default(), &mut Some(3));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_default(self) -> &'a mut V
+    pub fn or_default(self) -> CowValueGuard<V>
     where
         K: Hash,
         S: BuildHasher,
@@ -5264,13 +4817,13 @@ impl<'a, K, V: Default, S, A: Allocator> Entry<'a, K, V, S, A> {
     }
 }
 
-impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
+impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, 'b, K, V, S, A> {
     /// Gets a reference to the key in the entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{Entry, HashMap};
+    /// use cow_hashbrown::hash_map::{Entry, HashMap};
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.entry("poneyland").or_insert(12);
@@ -5291,8 +4844,8 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::Entry;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::Entry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// // The map is empty
@@ -5310,8 +4863,21 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// assert!(map.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove_entry(self) -> (K, V) {
-        unsafe { self.table.table.remove(self.elem).0 }
+    pub fn remove_entry(self) -> (K, Arc<ArcSwap<V>>)
+    where
+        K: Equivalent<K>,
+    {
+        self.table
+            .table
+            .rcu(|t| unsafe {
+                let what = self.elem.as_ref();
+                let elem = t.find(self.hash, equivalent_key(&what.0));
+                if let Some(elem) = elem {
+                    t.remove(elem);
+                }
+                (what.0.clone(), what.1.clone())
+            })
+            .inner
     }
 
     /// Gets a reference to the value in the entry.
@@ -5319,8 +4885,8 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::Entry;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::Entry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.entry("poneyland").or_insert(12);
@@ -5331,8 +4897,9 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// }
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get(&self) -> &V {
-        unsafe { &self.elem.as_ref().1 }
+    pub fn get(&self) -> CowValueGuard<V> {
+        let ret = unsafe { &self.elem.as_ref().1 };
+        CowValueGuard::new(ret.clone())
     }
 
     /// Gets a mutable reference to the value in the entry.
@@ -5345,8 +4912,8 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::Entry;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::Entry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.entry("poneyland").or_insert(12);
@@ -5363,8 +4930,9 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 24);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_mut(&mut self) -> &mut V {
-        unsafe { &mut self.elem.as_mut().1 }
+    pub fn get_mut(&self) -> CowValueGuard<V> {
+        let ret = unsafe { &self.elem.as_mut().1 };
+        CowValueGuard::new(ret.clone())
     }
 
     /// Converts the OccupiedEntry into a mutable reference to the value in the entry
@@ -5377,7 +4945,7 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{Entry, HashMap};
+    /// use cow_hashbrown::hash_map::{Entry, HashMap};
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.entry("poneyland").or_insert(12);
@@ -5394,8 +4962,9 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 22);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_mut(self) -> &'a mut V {
-        unsafe { &mut self.elem.as_mut().1 }
+    pub fn into_mut(self) -> CowValueGuard<V> {
+        let ret = unsafe { &mut self.elem.as_mut().1 };
+        CowValueGuard::new(ret.clone())
     }
 
     /// Sets the value of the entry, and returns the entry's old value.
@@ -5403,8 +4972,8 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::Entry;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::Entry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.entry("poneyland").or_insert(12);
@@ -5416,8 +4985,16 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 15);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(&mut self, value: V) -> V {
-        mem::replace(self.get_mut(), value)
+    pub fn insert(&self, value: V) -> Arc<V> {
+        unsafe {
+            let mut ret = self.elem.inner.as_ref().1.load_full();
+            let value = Arc::new(value);
+            self.elem.as_ref().1.rcu(|v| {
+                ret = v.clone();
+                value.clone()
+            });
+            ret
+        }
     }
 
     /// Takes the value out of the entry, and returns it.
@@ -5426,8 +5003,8 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::Entry;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::Entry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// // The map is empty
@@ -5444,8 +5021,11 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// assert!(map.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove(self) -> V {
-        self.remove_entry().1
+    pub fn remove(self) -> CowValueGuard<V>
+    where
+        K: Equivalent<K>,
+    {
+        CowValueGuard::new(self.remove_entry().1)
     }
 
     /// Replaces the entry, returning the old key and value. The new key in the hash map will be
@@ -5458,7 +5038,7 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    ///  use hashbrown::hash_map::{Entry, HashMap};
+    ///  use cow_hashbrown::hash_map::{Entry, HashMap};
     ///  use std::rc::Rc;
     ///
     ///  let mut map: HashMap<Rc<String>, u32> = HashMap::new();
@@ -5480,13 +5060,14 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     ///  assert_eq!(map[&"Stringthing".to_owned()], 16);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn replace_entry(self, value: V) -> (K, V) {
+    pub fn replace_entry(self, value: V) -> (K, CowValueGuard<V>) {
         let entry = unsafe { self.elem.as_mut() };
 
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
         let old_key = mem::replace(&mut entry.0, self.key.unwrap());
         let old_value = mem::replace(&mut entry.1, value);
 
-        (old_key, old_value)
+        (old_key, CowValueGuard::new(old_value))
     }
 
     /// Replaces the key in the hash map with the key used to create this entry.
@@ -5498,7 +5079,7 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{Entry, HashMap};
+    /// use cow_hashbrown::hash_map::{Entry, HashMap};
     /// use std::rc::Rc;
     ///
     /// let mut map: HashMap<Rc<String>, usize> = HashMap::with_capacity(6);
@@ -5546,8 +5127,8 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::Entry;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::Entry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// map.insert("poneyland", 42);
@@ -5588,45 +5169,50 @@ impl<'a, K, V, S, A: Allocator> OccupiedEntry<'a, K, V, S, A> {
     /// assert!(!map.contains_key("poneyland"));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn replace_entry_with<F>(self, f: F) -> Entry<'a, K, V, S, A>
+    pub fn replace_entry_with<F>(self, f: F) -> Entry<'a, 'b, K, V, S, A>
     where
-        F: FnOnce(&K, V) -> Option<V>,
+        F: Fn(&K, &V) -> Option<V>,
+        K: Equivalent<K>,
     {
-        unsafe {
-            let mut spare_key = None;
-
-            self.table
-                .table
-                .replace_bucket_with(self.elem.clone(), |(key, value)| {
-                    if let Some(new_value) = f(&key, value) {
-                        Some((key, new_value))
-                    } else {
-                        spare_key = Some(key);
-                        None
+        let elem = unsafe { self.elem.inner.as_ref() };
+        let key = &elem.0;
+        let value = elem.1.load();
+        loop {
+            match f(&key, &value) {
+                Some(new) => {
+                    let prev = elem.1.compare_and_swap(&value, Arc::new(new));
+                    let swapped = ptr_eq(&value, &*prev);
+                    if swapped {
+                        return Entry::Occupied(self);
                     }
-                });
-
-            if let Some(key) = spare_key {
-                Entry::Vacant(VacantEntry {
-                    hash: self.hash,
-                    key,
-                    table: self.table,
-                })
-            } else {
-                Entry::Occupied(self)
+                }
+                None => {
+                    self.table.table.rcu(|t| unsafe {
+                        let key = key.clone();
+                        let elem = t.find(self.hash, equivalent_key(&key));
+                        if let Some(elem) = elem {
+                            t.remove(elem);
+                        }
+                    });
+                    return Entry::Vacant(VacantEntry {
+                        hash: self.hash,
+                        key: key.clone(),
+                        table: self.table,
+                    });
+                }
             }
         }
     }
 }
 
-impl<'a, K, V, S, A: Allocator> VacantEntry<'a, K, V, S, A> {
+impl<'a, K: Clone, V, S, A: Allocator + Clone> VacantEntry<'a, K, V, S, A> {
     /// Gets a reference to the key that would be used when inserting a value
     /// through the `VacantEntry`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     /// assert_eq!(map.entry("poneyland").key(), &"poneyland");
@@ -5641,7 +5227,7 @@ impl<'a, K, V, S, A: Allocator> VacantEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{Entry, HashMap};
+    /// use cow_hashbrown::hash_map::{Entry, HashMap};
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -5661,8 +5247,8 @@ impl<'a, K, V, S, A: Allocator> VacantEntry<'a, K, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::Entry;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::Entry;
     ///
     /// let mut map: HashMap<&str, u32> = HashMap::new();
     ///
@@ -5672,31 +5258,39 @@ impl<'a, K, V, S, A: Allocator> VacantEntry<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 37);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, value: V) -> &'a mut V
+    pub fn insert(self, value: V) -> CowValueGuard<V>
     where
         K: Hash,
         S: BuildHasher,
     {
-        let table = &mut self.table.table;
-        let entry = table.insert_entry(
-            self.hash,
-            (self.key, value),
-            make_hasher::<_, V, S>(&self.table.hash_builder),
-        );
-        &mut entry.1
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
+        let entry = self.table.table.rcu(|t| {
+            t.insert_entry(
+                self.hash,
+                (self.key.clone(), value.clone()),
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
+            )
+        });
+        CowValueGuard::new(entry.1.clone())
     }
 
     #[cfg_attr(feature = "inline-more", inline)]
-    pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, S, A>
+    pub(crate) fn insert_entry<'b>(self, value: V) -> OccupiedEntry<'a, 'b, K, V, S, A>
     where
         K: Hash,
         S: BuildHasher,
+        K: 'b,
+        V: 'b,
+        A: 'b,
     {
-        let elem = self.table.table.insert(
-            self.hash,
-            (self.key, value),
-            make_hasher::<_, V, S>(&self.table.hash_builder),
-        );
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
+        let elem = self.table.table.rcu(|t| {
+            t.insert(
+                self.hash,
+                (self.key.clone(), value.clone()),
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
+            )
+        });
         OccupiedEntry {
             hash: self.hash,
             key: None,
@@ -5706,13 +5300,15 @@ impl<'a, K, V, S, A: Allocator> VacantEntry<'a, K, V, S, A> {
     }
 }
 
-impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
+impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
+    EntryRef<'a, 'b, 'c, K, Q, V, S, A>
+{
     /// Sets the value of the entry, and returns an OccupiedEntryRef.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// let entry = map.entry_ref("horseyland").insert(37);
@@ -5720,10 +5316,13 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// assert_eq!(entry.key(), "horseyland");
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, value: V) -> OccupiedEntryRef<'a, 'b, K, Q, V, S, A>
+    pub fn insert(self, value: V) -> OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
+        V: 'c,
+        K: 'c,
+        A: 'c,
     {
         match self {
             EntryRef::Occupied(mut entry) => {
@@ -5740,7 +5339,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     ///
@@ -5753,7 +5352,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert(self, default: V) -> &'a mut V
+    pub fn or_insert(self, default: V) -> CowValueGuard<V>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
@@ -5770,7 +5369,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     ///
@@ -5783,7 +5382,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> CowValueGuard<V>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
@@ -5801,7 +5400,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<String, usize> = HashMap::new();
     ///
@@ -5814,7 +5413,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// assert_eq!(map["poneyland"], 18);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with_key<F: FnOnce(&Q) -> V>(self, default: F) -> &'a mut V
+    pub fn or_insert_with_key<F: FnOnce(&Q) -> V>(self, default: F) -> CowValueGuard<V>
     where
         K: Hash + Borrow<Q> + From<&'b Q>,
         S: BuildHasher,
@@ -5833,7 +5432,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// map.entry_ref("poneyland").or_insert(3);
@@ -5859,7 +5458,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     ///
@@ -5876,11 +5475,17 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn and_modify<F>(self, f: F) -> Self
     where
-        F: FnOnce(&mut V),
+        F: Fn(&mut V),
+        V: Clone,
     {
         match self {
-            EntryRef::Occupied(mut entry) => {
-                f(entry.get_mut());
+            EntryRef::Occupied(entry) => {
+                let v = unsafe { &entry.elem.as_ref().1 };
+                v.rcu(|v| {
+                    let mut v = v.deref().clone();
+                    f(&mut v);
+                    v
+                });
                 EntryRef::Occupied(entry)
             }
             EntryRef::Vacant(entry) => EntryRef::Vacant(entry),
@@ -5894,8 +5499,8 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::EntryRef;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::EntryRef;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     ///
@@ -5944,7 +5549,8 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn and_replace_entry_with<F>(self, f: F) -> Self
     where
-        F: FnOnce(&K, V) -> Option<V>,
+        F: Fn(&K, &V) -> Option<V>,
+        K: Equivalent<K>,
     {
         match self {
             EntryRef::Occupied(entry) => entry.replace_entry_with(f),
@@ -5953,14 +5559,16 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
     }
 }
 
-impl<'a, 'b, K, Q: ?Sized, V: Default, S, A: Allocator> EntryRef<'a, 'b, K, Q, V, S, A> {
+impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V: Default + Clone, S, A: Allocator + Clone>
+    EntryRef<'a, 'b, 'c, K, Q, V, S, A>
+{
     /// Ensures a value is in the entry by inserting the default value if empty,
     /// and returns a mutable reference to the value in the entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<String, Option<u32>> = HashMap::new();
     ///
@@ -5974,7 +5582,7 @@ impl<'a, 'b, K, Q: ?Sized, V: Default, S, A: Allocator> EntryRef<'a, 'b, K, Q, V
     /// assert_eq!(map.entry_ref("horseland").or_default(), &mut Some(3));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_default(self) -> &'a mut V
+    pub fn or_default(self) -> CowValueGuard<V>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
@@ -5986,13 +5594,15 @@ impl<'a, 'b, K, Q: ?Sized, V: Default, S, A: Allocator> EntryRef<'a, 'b, K, Q, V
     }
 }
 
-impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V, S, A> {
+impl<'a, 'b, 'c, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
+    OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
+{
     /// Gets a reference to the key in the entry.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{EntryRef, HashMap};
+    /// use cow_hashbrown::hash_map::{EntryRef, HashMap};
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// map.entry_ref("poneyland").or_insert(12);
@@ -6013,8 +5623,8 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::EntryRef;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::EntryRef;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// // The map is empty
@@ -6032,8 +5642,18 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// assert!(map.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove_entry(self) -> (K, V) {
-        unsafe { self.table.table.remove(self.elem).0 }
+    pub fn remove_entry(self) -> (K, Arc<V>)
+    where
+        K: Equivalent<K>,
+    {
+        let ret = self.table.table.rcu(|t| unsafe {
+            let elem = t.find(self.hash, equivalent_key(self.key()));
+            if let Some(elem) = elem {
+                t.remove(elem);
+            }
+            self.elem.as_ref()
+        });
+        (ret.inner.0.clone(), ret.inner.1.load_full())
     }
 
     /// Gets a reference to the value in the entry.
@@ -6041,8 +5661,8 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::EntryRef;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::EntryRef;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// map.entry_ref("poneyland").or_insert(12);
@@ -6053,8 +5673,9 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// }
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get(&self) -> &V {
-        unsafe { &self.elem.as_ref().1 }
+    pub fn get(&self) -> Arc<V> {
+        let ret = unsafe { &self.elem.as_ref().1 };
+        ret.load_full()
     }
 
     /// Gets a mutable reference to the value in the entry.
@@ -6067,8 +5688,8 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::EntryRef;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::EntryRef;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// map.entry_ref("poneyland").or_insert(12);
@@ -6085,8 +5706,9 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// assert_eq!(map["poneyland"], 24);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_mut(&mut self) -> &mut V {
-        unsafe { &mut self.elem.as_mut().1 }
+    pub fn get_mut(&mut self) -> CowValueGuard<V> {
+        let ret = unsafe { &mut self.elem.as_mut().1 };
+        CowValueGuard::new(ret.clone())
     }
 
     /// Converts the OccupiedEntryRef into a mutable reference to the value in the entry
@@ -6099,7 +5721,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{EntryRef, HashMap};
+    /// use cow_hashbrown::hash_map::{EntryRef, HashMap};
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// map.entry_ref("poneyland").or_insert(12);
@@ -6114,8 +5736,9 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// assert_eq!(map["poneyland"], 22);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_mut(self) -> &'a mut V {
-        unsafe { &mut self.elem.as_mut().1 }
+    pub fn into_mut(self) -> CowValueGuard<V> {
+        let ret = unsafe { &mut self.elem.as_mut().1 };
+        CowValueGuard::new(ret.clone())
     }
 
     /// Sets the value of the entry, and returns the entry's old value.
@@ -6123,8 +5746,8 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::EntryRef;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::EntryRef;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// map.entry_ref("poneyland").or_insert(12);
@@ -6136,8 +5759,16 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// assert_eq!(map["poneyland"], 15);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(&mut self, value: V) -> V {
-        mem::replace(self.get_mut(), value)
+    pub fn insert(&mut self, value: V) -> Arc<V> {
+        unsafe {
+            let mut ret = self.elem.inner.as_ref().1.load_full();
+            let value = Arc::new(value);
+            self.elem.as_ref().1.rcu(|v| {
+                ret = v.clone();
+                value.clone()
+            });
+            ret
+        }
     }
 
     /// Takes the value out of the entry, and returns it.
@@ -6146,8 +5777,8 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::EntryRef;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::EntryRef;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// // The map is empty
@@ -6164,7 +5795,10 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// assert!(map.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove(self) -> V {
+    pub fn remove(self) -> Arc<V>
+    where
+        K: Equivalent<K>,
+    {
         self.remove_entry().1
     }
 
@@ -6178,7 +5812,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{EntryRef, HashMap};
+    /// use cow_hashbrown::hash_map::{EntryRef, HashMap};
     /// use std::rc::Rc;
     ///
     /// let mut map: HashMap<Rc<str>, u32> = HashMap::new();
@@ -6199,16 +5833,20 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// assert_eq!(map["Stringthing"], 16);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn replace_entry(self, value: V) -> (K, V)
+    pub fn replace_entry(self, value: V) -> (K, Arc<V>)
     where
         K: From<&'b Q>,
     {
-        let entry = unsafe { self.elem.as_mut() };
-
-        let old_key = mem::replace(&mut entry.0, self.key.unwrap().into_owned());
-        let old_value = mem::replace(&mut entry.1, value);
-
-        (old_key, old_value)
+        let val = unsafe {
+            let mut ret = self.elem.inner.as_ref().1.load_full();
+            let value = Arc::new(value);
+            self.elem.as_ref().1.rcu(|v| {
+                ret = v.clone();
+                value.clone()
+            });
+            ret
+        };
+        (self.key.unwrap().into_owned(), val)
     }
 
     /// Replaces the key in the hash map with the key used to create this entry.
@@ -6220,7 +5858,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{EntryRef, HashMap};
+    /// use cow_hashbrown::hash_map::{EntryRef, HashMap};
     /// use std::rc::Rc;
     ///
     /// let mut map: HashMap<Rc<str>, usize> = HashMap::with_capacity(6);
@@ -6265,8 +5903,8 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::EntryRef;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::EntryRef;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// map.insert("poneyland".to_string(), 42);
@@ -6307,45 +5945,53 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> OccupiedEntryRef<'a, 'b, K, Q, V,
     /// assert!(!map.contains_key("poneyland"));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn replace_entry_with<F>(self, f: F) -> EntryRef<'a, 'b, K, Q, V, S, A>
+    pub fn replace_entry_with<F>(self, f: F) -> EntryRef<'a, 'b, 'c, K, Q, V, S, A>
     where
-        F: FnOnce(&K, V) -> Option<V>,
+        F: Fn(&K, &V) -> Option<V>,
+        K: Equivalent<K>,
     {
-        unsafe {
-            let mut spare_key = None;
-
-            self.table
-                .table
-                .replace_bucket_with(self.elem.clone(), |(key, value)| {
-                    if let Some(new_value) = f(&key, value) {
-                        Some((key, new_value))
-                    } else {
-                        spare_key = Some(KeyOrRef::Owned(key));
-                        None
+        let elem = unsafe { self.elem.as_ref() };
+        let key = &elem.0;
+        let value = elem.1.load();
+        loop {
+            match f(&key, &value) {
+                Some(new) => {
+                    let prev = elem.1.compare_and_swap(&value, Arc::new(new));
+                    let swapped = ptr_eq(&value, &*prev);
+                    if swapped {
+                        return EntryRef::Occupied(self);
                     }
-                });
-
-            if let Some(key) = spare_key {
-                EntryRef::Vacant(VacantEntryRef {
-                    hash: self.hash,
-                    key,
-                    table: self.table,
-                })
-            } else {
-                EntryRef::Occupied(self)
+                }
+                None => {
+                    self.table.table.rcu(|t| {
+                        let elem = t.find(self.hash, equivalent_key(self.key()));
+                        if let Some(elem) = elem {
+                            unsafe {
+                                t.remove(elem);
+                            }
+                        }
+                    });
+                    return EntryRef::Vacant(VacantEntryRef {
+                        hash: self.hash,
+                        key: KeyOrRef::Owned(key.clone()),
+                        table: self.table,
+                    });
+                }
             }
         }
     }
 }
 
-impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> VacantEntryRef<'a, 'b, K, Q, V, S, A> {
+impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
+    VacantEntryRef<'a, 'b, K, Q, V, S, A>
+{
     /// Gets a reference to the key that would be used when inserting a value
     /// through the `VacantEntryRef`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// let key: &str = "poneyland";
@@ -6364,7 +6010,7 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> VacantEntryRef<'a, 'b, K, Q, V, S
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::{EntryRef, HashMap};
+    /// use cow_hashbrown::hash_map::{EntryRef, HashMap};
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// let key: &str = "poneyland";
@@ -6388,8 +6034,8 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> VacantEntryRef<'a, 'b, K, Q, V, S
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashMap;
-    /// use hashbrown::hash_map::EntryRef;
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::EntryRef;
     ///
     /// let mut map: HashMap<String, u32> = HashMap::new();
     /// let key: &str = "poneyland";
@@ -6400,31 +6046,42 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> VacantEntryRef<'a, 'b, K, Q, V, S
     /// assert_eq!(map["poneyland"], 37);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, value: V) -> &'a mut V
+    pub fn insert(self, value: V) -> CowValueGuard<V>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
     {
-        let table = &mut self.table.table;
-        let entry = table.insert_entry(
-            self.hash,
-            (self.key.into_owned(), value),
-            make_hasher::<_, V, S>(&self.table.hash_builder),
-        );
-        &mut entry.1
+        let table = &self.table.table;
+        let key = self.key.into_owned();
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
+        let entry = table.rcu(|t| {
+            t.insert_entry(
+                self.hash,
+                (key.clone(), value.clone()),
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
+            )
+        });
+        CowValueGuard::new(entry.1.clone())
     }
 
     #[cfg_attr(feature = "inline-more", inline)]
-    fn insert_entry(self, value: V) -> OccupiedEntryRef<'a, 'b, K, Q, V, S, A>
+    fn insert_entry<'c>(self, value: V) -> OccupiedEntryRef<'a, 'b, 'c, K, Q, V, S, A>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
+        V: 'c,
+        K: 'c,
+        A: 'c,
     {
-        let elem = self.table.table.insert(
-            self.hash,
-            (self.key.into_owned(), value),
-            make_hasher::<_, V, S>(&self.table.hash_builder),
-        );
+        let key = self.key.into_owned();
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
+        let elem = self.table.table.rcu(|t| {
+            t.insert(
+                self.hash,
+                (key.clone(), value.clone()),
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
+            )
+        });
         OccupiedEntryRef {
             hash: self.hash,
             key: None,
@@ -6434,11 +6091,11 @@ impl<'a, 'b, K, Q: ?Sized, V, S, A: Allocator> VacantEntryRef<'a, 'b, K, Q, V, S
     }
 }
 
-impl<K, V, S, A> FromIterator<(K, V)> for HashMap<K, V, S, A>
+impl<K: Clone, V, S, A> FromIterator<(K, V)> for CowHashMap<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher + Default,
-    A: Default + Allocator,
+    A: Default + Allocator + Clone,
 {
     #[cfg_attr(feature = "inline-more", inline)]
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
@@ -6454,11 +6111,11 @@ where
 
 /// Inserts all new key-values from the iterator and replaces values with existing
 /// keys with new values returned from the iterator.
-impl<K, V, S, A> Extend<(K, V)> for HashMap<K, V, S, A>
+impl<K: Clone, V, S, A> Extend<(K, V)> for CowHashMap<K, V, S, A>
 where
     K: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Inserts all new key-values from the iterator to existing `HashMap<K, V, S, A>`.
     /// Replace values with existing keys with new values returned from the iterator.
@@ -6466,7 +6123,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::HashMap;
+    /// use cow_hashbrown::hash_map::HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, 100);
@@ -6537,12 +6194,12 @@ where
 
 /// Inserts all new key-values from the iterator and replaces values with existing
 /// keys with new values returned from the iterator.
-impl<'a, K, V, S, A> Extend<(&'a K, &'a V)> for HashMap<K, V, S, A>
+impl<'a, K: Clone, V, S, A> Extend<(&'a K, &'a V)> for CowHashMap<K, V, S, A>
 where
     K: Eq + Hash + Copy,
     V: Copy,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Inserts all new key-values from the iterator to existing `HashMap<K, V, S, A>`.
     /// Replace values with existing keys with new values returned from the iterator.
@@ -6553,7 +6210,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::HashMap;
+    /// use cow_hashbrown::hash_map::HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, 100);
@@ -6602,12 +6259,12 @@ where
 
 /// Inserts all new key-values from the iterator and replaces values with existing
 /// keys with new values returned from the iterator.
-impl<'a, K, V, S, A> Extend<&'a (K, V)> for HashMap<K, V, S, A>
+impl<'a, K: Clone, V, S, A> Extend<&'a (K, V)> for CowHashMap<K, V, S, A>
 where
     K: Eq + Hash + Copy,
     V: Copy,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Inserts all new key-values from the iterator to existing `HashMap<K, V, S, A>`.
     /// Replace values with existing keys with new values returned from the iterator.
@@ -6618,7 +6275,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_map::HashMap;
+    /// use cow_hashbrown::hash_map::HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, 100);
@@ -6660,56 +6317,13 @@ where
     }
 }
 
-#[allow(dead_code)]
-fn assert_covariance() {
-    fn map_key<'new>(v: HashMap<&'static str, u8>) -> HashMap<&'new str, u8> {
-        v
-    }
-    fn map_val<'new>(v: HashMap<u8, &'static str>) -> HashMap<u8, &'new str> {
-        v
-    }
-    fn iter_key<'a, 'new>(v: Iter<'a, &'static str, u8>) -> Iter<'a, &'new str, u8> {
-        v
-    }
-    fn iter_val<'a, 'new>(v: Iter<'a, u8, &'static str>) -> Iter<'a, u8, &'new str> {
-        v
-    }
-    fn into_iter_key<'new, A: Allocator>(
-        v: IntoIter<&'static str, u8, A>,
-    ) -> IntoIter<&'new str, u8, A> {
-        v
-    }
-    fn into_iter_val<'new, A: Allocator>(
-        v: IntoIter<u8, &'static str, A>,
-    ) -> IntoIter<u8, &'new str, A> {
-        v
-    }
-    fn keys_key<'a, 'new>(v: Keys<'a, &'static str, u8>) -> Keys<'a, &'new str, u8> {
-        v
-    }
-    fn keys_val<'a, 'new>(v: Keys<'a, u8, &'static str>) -> Keys<'a, u8, &'new str> {
-        v
-    }
-    fn values_key<'a, 'new>(v: Values<'a, &'static str, u8>) -> Values<'a, &'new str, u8> {
-        v
-    }
-    fn values_val<'a, 'new>(v: Values<'a, u8, &'static str>) -> Values<'a, u8, &'new str> {
-        v
-    }
-    fn drain<'new>(
-        d: Drain<'static, &'static str, &'static str>,
-    ) -> Drain<'new, &'new str, &'new str> {
-        d
-    }
-}
-
 #[cfg(test)]
 mod test_map {
+    use super::CowHashMap;
     use super::DefaultHashBuilder;
     use super::Entry::{Occupied, Vacant};
     use super::EntryRef;
-    use super::{HashMap, RawEntryMut};
-    use alloc::string::{String, ToString};
+    use alloc::string::ToString;
     use alloc::sync::Arc;
     use allocator_api2::alloc::{AllocError, Allocator, Global};
     use core::alloc::Layout;
@@ -6722,7 +6336,7 @@ mod test_map {
 
     #[test]
     fn test_zero_capacities() {
-        type HM = HashMap<i32, i32>;
+        type HM = CowHashMap<i32, i32>;
 
         let m = HM::new();
         assert_eq!(m.capacity(), 0);
@@ -6747,14 +6361,14 @@ mod test_map {
         m.shrink_to_fit();
         assert_eq!(m.capacity(), 0);
 
-        let mut m = HM::new();
+        let m = HM::new();
         m.reserve(0);
         assert_eq!(m.capacity(), 0);
     }
 
     #[test]
     fn test_create_capacity_zero() {
-        let mut m = HashMap::with_capacity(0);
+        let mut m = CowHashMap::with_capacity(0);
 
         assert!(m.insert(1, 1).is_none());
 
@@ -6764,7 +6378,7 @@ mod test_map {
 
     #[test]
     fn test_insert() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
         assert_eq!(m.len(), 0);
         assert!(m.insert(1, 2).is_none());
         assert_eq!(m.len(), 1);
@@ -6776,7 +6390,7 @@ mod test_map {
 
     #[test]
     fn test_clone() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
         assert_eq!(m.len(), 0);
         assert!(m.insert(1, 2).is_none());
         assert_eq!(m.len(), 1);
@@ -6791,8 +6405,8 @@ mod test_map {
 
     #[test]
     fn test_clone_from() {
-        let mut m = HashMap::new();
-        let mut m2 = HashMap::new();
+        let mut m = CowHashMap::new();
+        let mut m2 = CowHashMap::new();
         assert_eq!(m.len(), 0);
         assert!(m.insert(1, 2).is_none());
         assert_eq!(m.len(), 1);
@@ -6842,7 +6456,7 @@ mod test_map {
         });
 
         {
-            let mut m = HashMap::new();
+            let mut m = CowHashMap::new();
 
             DROP_VECTOR.with(|v| {
                 for i in 0..200 {
@@ -6901,7 +6515,7 @@ mod test_map {
         });
 
         let hm = {
-            let mut hm = HashMap::new();
+            let mut hm = CowHashMap::new();
 
             DROP_VECTOR.with(|v| {
                 for i in 0..200 {
@@ -6927,6 +6541,12 @@ mod test_map {
         // By the way, ensure that cloning doesn't screw up the dropping.
         drop(hm.clone());
 
+        DROP_VECTOR.with(|v| {
+            for i in 0..200 {
+                assert_eq!(v.borrow()[i], 1);
+            }
+        });
+
         {
             let mut half = hm.into_iter().take(50);
 
@@ -6937,15 +6557,6 @@ mod test_map {
             });
 
             for _ in half.by_ref() {}
-
-            DROP_VECTOR.with(|v| {
-                let nk = (0..100).filter(|&i| v.borrow()[i] == 1).count();
-
-                let nv = (0..100).filter(|&i| v.borrow()[i + 100] == 1).count();
-
-                assert_eq!(nk, 50);
-                assert_eq!(nv, 50);
-            });
         };
 
         DROP_VECTOR.with(|v| {
@@ -6956,14 +6567,70 @@ mod test_map {
     }
 
     #[test]
+    fn test_map_drop() {
+        DROP_VECTOR.with(|v| {
+            *v.borrow_mut() = vec![0; 200];
+        });
+
+        let hm = {
+            let mut hm = CowHashMap::new();
+
+            DROP_VECTOR.with(|v| {
+                for i in 0..200 {
+                    assert_eq!(v.borrow()[i], 0);
+                }
+            });
+
+            for i in 0..100 {
+                let d1 = Droppable::new(i);
+                let d2 = Droppable::new(i + 100);
+                hm.insert(d1, d2);
+            }
+
+            DROP_VECTOR.with(|v| {
+                for i in 0..200 {
+                    assert_eq!(v.borrow()[i], 1);
+                }
+            });
+
+            hm
+        };
+
+        // By the way, ensure that cloning doesn't screw up the dropping.
+        drop(hm.clone());
+
+        DROP_VECTOR.with(|v| {
+            for i in 0..200 {
+                assert_eq!(v.borrow()[i], 1);
+            }
+        });
+
+        for _ in hm.iter() {}
+
+        DROP_VECTOR.with(|v| {
+            for i in 0..200 {
+                assert_eq!(v.borrow()[i], 1);
+            }
+        });
+
+        drop(hm);
+
+        DROP_VECTOR.with(|v| {
+            for i in 0..200 {
+                assert_eq!(v.borrow()[i], 0);
+            }
+        });
+    }
+
+    #[test]
     fn test_empty_remove() {
-        let mut m: HashMap<i32, bool> = HashMap::new();
+        let mut m: CowHashMap<i32, bool> = CowHashMap::new();
         assert_eq!(m.remove(&0), None);
     }
 
     #[test]
     fn test_empty_entry() {
-        let mut m: HashMap<i32, bool> = HashMap::new();
+        let m: CowHashMap<i32, bool> = CowHashMap::new();
         match m.entry(0) {
             Occupied(_) => panic!(),
             Vacant(_) => {}
@@ -6974,7 +6641,7 @@ mod test_map {
 
     #[test]
     fn test_empty_entry_ref() {
-        let mut m: HashMap<std::string::String, bool> = HashMap::new();
+        let mut m: CowHashMap<std::string::String, bool> = CowHashMap::new();
         match m.entry_ref("poneyland") {
             EntryRef::Occupied(_) => panic!(),
             EntryRef::Vacant(_) => {}
@@ -6985,7 +6652,7 @@ mod test_map {
 
     #[test]
     fn test_empty_iter() {
-        let mut m: HashMap<i32, bool> = HashMap::new();
+        let m: CowHashMap<i32, bool> = CowHashMap::new();
         assert_eq!(m.drain().next(), None);
         assert_eq!(m.keys().next(), None);
         assert_eq!(m.values().next(), None);
@@ -7000,7 +6667,7 @@ mod test_map {
     #[test]
     #[cfg_attr(miri, ignore)] // FIXME: takes too long
     fn test_lots_of_insertions() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
 
         // Try this a few times to make sure we never screw up the hashmap's
         // internal state.
@@ -7012,7 +6679,8 @@ mod test_map {
 
                 for j in 1..=i {
                     let r = m.get(&j);
-                    assert_eq!(r, Some(&j));
+                    let j = Arc::new(j);
+                    assert_eq!(r, Some(j));
                 }
 
                 for j in i + 1..1001 {
@@ -7063,21 +6731,21 @@ mod test_map {
 
     #[test]
     fn test_find_mut() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
         assert!(m.insert(1, 12).is_none());
         assert!(m.insert(2, 8).is_none());
         assert!(m.insert(5, 14).is_none());
         let new = 100;
         match m.get_mut(&5) {
             None => panic!(),
-            Some(x) => *x = new,
+            Some(mut x) => *x = new,
         }
-        assert_eq!(m.get(&5), Some(&new));
+        assert_eq!(m.get(&5), Some(Arc::new(new)));
     }
 
     #[test]
     fn test_insert_overwrite() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
         assert!(m.insert(1, 2).is_none());
         assert_eq!(*m.get(&1).unwrap(), 2);
         assert!(m.insert(1, 3).is_some());
@@ -7086,7 +6754,7 @@ mod test_map {
 
     #[test]
     fn test_insert_conflicts() {
-        let mut m = HashMap::with_capacity(4);
+        let mut m = CowHashMap::with_capacity(4);
         assert!(m.insert(1, 2).is_none());
         assert!(m.insert(5, 3).is_none());
         assert!(m.insert(9, 4).is_none());
@@ -7097,7 +6765,7 @@ mod test_map {
 
     #[test]
     fn test_conflict_remove() {
-        let mut m = HashMap::with_capacity(4);
+        let mut m = CowHashMap::with_capacity(4);
         assert!(m.insert(1, 2).is_none());
         assert_eq!(*m.get(&1).unwrap(), 2);
         assert!(m.insert(5, 3).is_none());
@@ -7114,19 +6782,19 @@ mod test_map {
 
     #[test]
     fn test_insert_unique_unchecked() {
-        let mut map = HashMap::new();
+        let mut map = CowHashMap::new();
         let (k1, v1) = map.insert_unique_unchecked(10, 11);
-        assert_eq!((&10, &mut 11), (k1, v1));
+        assert_eq!((10, 11), (*k1, *v1));
         let (k2, v2) = map.insert_unique_unchecked(20, 21);
-        assert_eq!((&20, &mut 21), (k2, v2));
-        assert_eq!(Some(&11), map.get(&10));
-        assert_eq!(Some(&21), map.get(&20));
+        assert_eq!((20, 21), (*k2, *v2));
+        assert_eq!(Some(Arc::new(11)), map.get(&10));
+        assert_eq!(Some(Arc::new(21)), map.get(&20));
         assert_eq!(None, map.get(&30));
     }
 
     #[test]
     fn test_is_empty() {
-        let mut m = HashMap::with_capacity(4);
+        let mut m = CowHashMap::with_capacity(4);
         assert!(m.insert(1, 2).is_none());
         assert!(!m.is_empty());
         assert!(m.remove(&1).is_some());
@@ -7135,23 +6803,23 @@ mod test_map {
 
     #[test]
     fn test_remove() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
         m.insert(1, 2);
-        assert_eq!(m.remove(&1), Some(2));
+        assert_eq!(m.remove(&1), Some(Arc::new(2)));
         assert_eq!(m.remove(&1), None);
     }
 
     #[test]
     fn test_remove_entry() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
         m.insert(1, 2);
-        assert_eq!(m.remove_entry(&1), Some((1, 2)));
+        assert_eq!(m.remove_entry(&1), Some((1, Arc::new(2))));
         assert_eq!(m.remove(&1), None);
     }
 
     #[test]
     fn test_iterate() {
-        let mut m = HashMap::with_capacity(4);
+        let mut m = CowHashMap::with_capacity(4);
         for i in 0..32 {
             assert!(m.insert(i, i * 2).is_none());
         }
@@ -7169,7 +6837,7 @@ mod test_map {
     #[test]
     fn test_keys() {
         let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-        let map: HashMap<_, _> = vec.into_iter().collect();
+        let map: CowHashMap<_, _> = vec.into_iter().collect();
         let keys: Vec<_> = map.keys().copied().collect();
         assert_eq!(keys.len(), 3);
         assert!(keys.contains(&1));
@@ -7180,32 +6848,32 @@ mod test_map {
     #[test]
     fn test_values() {
         let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-        let map: HashMap<_, _> = vec.into_iter().collect();
-        let values: Vec<_> = map.values().copied().collect();
+        let map: CowHashMap<_, _> = vec.into_iter().collect();
+        let values: Vec<_> = map.values().collect();
         assert_eq!(values.len(), 3);
-        assert!(values.contains(&'a'));
-        assert!(values.contains(&'b'));
-        assert!(values.contains(&'c'));
+        assert!(values.contains(&Arc::new('a')));
+        assert!(values.contains(&Arc::new('b')));
+        assert!(values.contains(&Arc::new('c')));
     }
 
     #[test]
     fn test_values_mut() {
         let vec = vec![(1, 1), (2, 2), (3, 3)];
-        let mut map: HashMap<_, _> = vec.into_iter().collect();
-        for value in map.values_mut() {
+        let map: CowHashMap<_, _> = vec.into_iter().collect();
+        for mut value in map.values_mut() {
             *value *= 2;
         }
-        let values: Vec<_> = map.values().copied().collect();
+        let values: Vec<_> = map.values().collect();
         assert_eq!(values.len(), 3);
-        assert!(values.contains(&2));
-        assert!(values.contains(&4));
-        assert!(values.contains(&6));
+        assert!(values.contains(&Arc::new(2)));
+        assert!(values.contains(&Arc::new(4)));
+        assert!(values.contains(&Arc::new(6)));
     }
 
     #[test]
     fn test_into_keys() {
         let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-        let map: HashMap<_, _> = vec.into_iter().collect();
+        let map: CowHashMap<_, _> = vec.into_iter().collect();
         let keys: Vec<_> = map.into_keys().collect();
 
         assert_eq!(keys.len(), 3);
@@ -7217,18 +6885,18 @@ mod test_map {
     #[test]
     fn test_into_values() {
         let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
-        let map: HashMap<_, _> = vec.into_iter().collect();
+        let map: CowHashMap<_, _> = vec.into_iter().collect();
         let values: Vec<_> = map.into_values().collect();
 
         assert_eq!(values.len(), 3);
-        assert!(values.contains(&'a'));
-        assert!(values.contains(&'b'));
-        assert!(values.contains(&'c'));
+        assert!(values.contains(&Arc::new('a')));
+        assert!(values.contains(&Arc::new('b')));
+        assert!(values.contains(&Arc::new('c')));
     }
 
     #[test]
     fn test_find() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
         assert!(m.get(&1).is_none());
         m.insert(1, 2);
         match m.get(&1) {
@@ -7238,27 +6906,9 @@ mod test_map {
     }
 
     #[test]
-    fn test_eq() {
-        let mut m1 = HashMap::new();
-        m1.insert(1, 2);
-        m1.insert(2, 3);
-        m1.insert(3, 4);
-
-        let mut m2 = HashMap::new();
-        m2.insert(1, 2);
-        m2.insert(2, 3);
-
-        assert!(m1 != m2);
-
-        m2.insert(3, 4);
-
-        assert_eq!(m1, m2);
-    }
-
-    #[test]
     fn test_show() {
-        let mut map = HashMap::new();
-        let empty: HashMap<i32, i32> = HashMap::new();
+        let mut map = CowHashMap::new();
+        let empty: CowHashMap<i32, i32> = CowHashMap::new();
 
         map.insert(1, 2);
         map.insert(3, 4);
@@ -7271,7 +6921,7 @@ mod test_map {
 
     #[test]
     fn test_expand() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
 
         assert_eq!(m.len(), 0);
         assert!(m.is_empty());
@@ -7289,7 +6939,7 @@ mod test_map {
 
     #[test]
     fn test_behavior_resize_policy() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
 
         assert_eq!(m.len(), 0);
         assert_eq!(m.raw_capacity(), 1);
@@ -7345,7 +6995,7 @@ mod test_map {
 
     #[test]
     fn test_reserve_shrink_to_fit() {
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
         m.insert(0, 0);
         m.remove(&0);
         assert!(m.capacity() >= m.len());
@@ -7361,7 +7011,7 @@ mod test_map {
         }
 
         for i in 100..(128 + 256) {
-            assert_eq!(m.remove(&i), Some(i));
+            assert_eq!(m.remove(&i), Some(Arc::new(i)));
         }
         m.shrink_to_fit();
 
@@ -7370,24 +7020,24 @@ mod test_map {
         assert!(m.capacity() >= m.len());
 
         for i in 0..100 {
-            assert_eq!(m.remove(&i), Some(i));
+            assert_eq!(m.remove(&i), Some(Arc::new(i)));
         }
         m.shrink_to_fit();
         m.insert(0, 0);
 
         assert_eq!(m.len(), 1);
         assert!(m.capacity() >= m.len());
-        assert_eq!(m.remove(&0), Some(0));
+        assert_eq!(m.remove(&0), Some(Arc::new(0)));
     }
 
     #[test]
     fn test_from_iter() {
         let xs = [(1, 1), (2, 2), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let map: HashMap<_, _> = xs.iter().copied().collect();
+        let map: CowHashMap<_, _> = xs.iter().copied().collect();
 
         for &(k, v) in &xs {
-            assert_eq!(map.get(&k), Some(&v));
+            assert_eq!(map.get(&k), Some(Arc::new(v)));
         }
 
         assert_eq!(map.iter().len(), xs.len() - 1);
@@ -7397,7 +7047,7 @@ mod test_map {
     fn test_size_hint() {
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let map: HashMap<_, _> = xs.iter().copied().collect();
+        let map: CowHashMap<_, _> = xs.iter().copied().collect();
 
         let mut iter = map.iter();
 
@@ -7410,7 +7060,7 @@ mod test_map {
     fn test_iter_len() {
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let map: HashMap<_, _> = xs.iter().copied().collect();
+        let map: CowHashMap<_, _> = xs.iter().copied().collect();
 
         let mut iter = map.iter();
 
@@ -7423,7 +7073,7 @@ mod test_map {
     fn test_mut_size_hint() {
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let mut map: HashMap<_, _> = xs.iter().copied().collect();
+        let map: CowHashMap<_, _> = xs.iter().copied().collect();
 
         let mut iter = map.iter_mut();
 
@@ -7436,7 +7086,7 @@ mod test_map {
     fn test_iter_mut_len() {
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let mut map: HashMap<_, _> = xs.iter().copied().collect();
+        let map: CowHashMap<_, _> = xs.iter().copied().collect();
 
         let mut iter = map.iter_mut();
 
@@ -7446,56 +7096,32 @@ mod test_map {
     }
 
     #[test]
-    fn test_index() {
-        let mut map = HashMap::new();
-
-        map.insert(1, 2);
-        map.insert(2, 1);
-        map.insert(3, 4);
-
-        assert_eq!(map[&2], 1);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_index_nonexistent() {
-        let mut map = HashMap::new();
-
-        map.insert(1, 2);
-        map.insert(2, 1);
-        map.insert(3, 4);
-
-        #[allow(clippy::no_effect)] // false positive lint
-        map[&4];
-    }
-
-    #[test]
     fn test_entry() {
         let xs = [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
 
-        let mut map: HashMap<_, _> = xs.iter().copied().collect();
+        let map: CowHashMap<_, _> = xs.iter().copied().collect();
 
         // Existing key (insert)
         match map.entry(1) {
             Vacant(_) => unreachable!(),
-            Occupied(mut view) => {
-                assert_eq!(view.get(), &10);
-                assert_eq!(view.insert(100), 10);
+            Occupied(view) => {
+                assert_eq!(*view.get(), 10);
+                assert_eq!(view.insert(100), Arc::new(10));
             }
         }
-        assert_eq!(map.get(&1).unwrap(), &100);
+        assert_eq!(map.get(&1).unwrap(), Arc::new(100));
         assert_eq!(map.len(), 6);
 
         // Existing key (update)
         match map.entry(2) {
             Vacant(_) => unreachable!(),
-            Occupied(mut view) => {
-                let v = view.get_mut();
+            Occupied(view) => {
+                let mut v = view.get_mut();
                 let new_v = (*v) * 10;
                 *v = new_v;
             }
         }
-        assert_eq!(map.get(&2).unwrap(), &200);
+        assert_eq!(map.get(&2).unwrap(), Arc::new(200));
         assert_eq!(map.len(), 6);
 
         // Existing key (take)
@@ -7515,7 +7141,7 @@ mod test_map {
                 assert_eq!(*view.insert(1000), 1000);
             }
         }
-        assert_eq!(map.get(&10).unwrap(), &1000);
+        assert_eq!(map.get(&10).unwrap(), Arc::new(1000));
         assert_eq!(map.len(), 6);
     }
 
@@ -7530,36 +7156,36 @@ mod test_map {
             ("Six".to_owned(), 60),
         ];
 
-        let mut map: HashMap<_, _> = xs.iter().cloned().collect();
+        let mut map: CowHashMap<_, _> = xs.iter().cloned().collect();
 
         // Existing key (insert)
         match map.entry_ref("One") {
             EntryRef::Vacant(_) => unreachable!(),
             EntryRef::Occupied(mut view) => {
-                assert_eq!(view.get(), &10);
-                assert_eq!(view.insert(100), 10);
+                assert_eq!(view.get(), Arc::new(10));
+                assert_eq!(view.insert(100), Arc::new(10));
             }
         }
-        assert_eq!(map.get("One").unwrap(), &100);
+        assert_eq!(map.get("One").unwrap(), Arc::new(100));
         assert_eq!(map.len(), 6);
 
         // Existing key (update)
         match map.entry_ref("Two") {
             EntryRef::Vacant(_) => unreachable!(),
             EntryRef::Occupied(mut view) => {
-                let v = view.get_mut();
+                let mut v = view.get_mut();
                 let new_v = (*v) * 10;
                 *v = new_v;
             }
         }
-        assert_eq!(map.get("Two").unwrap(), &200);
+        assert_eq!(map.get("Two").unwrap(), Arc::new(200));
         assert_eq!(map.len(), 6);
 
         // Existing key (take)
         match map.entry_ref("Three") {
             EntryRef::Vacant(_) => unreachable!(),
             EntryRef::Occupied(view) => {
-                assert_eq!(view.remove(), 30);
+                assert_eq!(view.remove(), Arc::new(30));
             }
         }
         assert_eq!(map.get("Three"), None);
@@ -7572,7 +7198,7 @@ mod test_map {
                 assert_eq!(*view.insert(1000), 1000);
             }
         }
-        assert_eq!(map.get("Ten").unwrap(), &1000);
+        assert_eq!(map.get("Ten").unwrap(), Arc::new(1000));
         assert_eq!(map.len(), 6);
     }
 
@@ -7580,13 +7206,13 @@ mod test_map {
     fn test_entry_take_doesnt_corrupt() {
         #![allow(deprecated)] //rand
                               // Test for #19292
-        fn check(m: &HashMap<i32, ()>) {
+        fn check(m: &CowHashMap<i32, ()>) {
             for k in m.keys() {
                 assert!(m.contains_key(k), "{k} is in keys() but not in the map?");
             }
         }
 
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
 
         let mut rng = {
             let seed = u64::from_le_bytes(*b"testseed");
@@ -7616,13 +7242,13 @@ mod test_map {
     fn test_entry_ref_take_doesnt_corrupt() {
         #![allow(deprecated)] //rand
                               // Test for #19292
-        fn check(m: &HashMap<std::string::String, ()>) {
+        fn check(m: &CowHashMap<std::string::String, ()>) {
             for k in m.keys() {
                 assert!(m.contains_key(k), "{k} is in keys() but not in the map?");
             }
         }
 
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
 
         let mut rng = {
             let seed = u64::from_le_bytes(*b"testseed");
@@ -7651,26 +7277,10 @@ mod test_map {
     }
 
     #[test]
-    fn test_extend_ref_k_ref_v() {
-        let mut a = HashMap::new();
-        a.insert(1, "one");
-        let mut b = HashMap::new();
-        b.insert(2, "two");
-        b.insert(3, "three");
-
-        a.extend(&b);
-
-        assert_eq!(a.len(), 3);
-        assert_eq!(a[&1], "one");
-        assert_eq!(a[&2], "two");
-        assert_eq!(a[&3], "three");
-    }
-
-    #[test]
     #[allow(clippy::needless_borrow)]
     fn test_extend_ref_kv_tuple() {
         use std::ops::AddAssign;
-        let mut a = HashMap::new();
+        let mut a = CowHashMap::new();
         a.insert(0, 0);
 
         fn create_arr<T: AddAssign<T> + Copy, const N: usize>(start: T, step: T) -> [(T, T); N] {
@@ -7694,13 +7304,13 @@ mod test_map {
         assert_eq!(a.len(), 300);
 
         for item in 0..300 {
-            assert_eq!(a[&item], item);
+            assert_eq!(a.get(&item).unwrap(), Arc::new(item));
         }
     }
 
     #[test]
     fn test_capacity_not_less_than_len() {
-        let mut a = HashMap::new();
+        let mut a = CowHashMap::new();
         let mut item = 0;
 
         for _ in 0..116 {
@@ -7725,43 +7335,43 @@ mod test_map {
 
     #[test]
     fn test_occupied_entry_key() {
-        let mut a = HashMap::new();
+        let mut a = CowHashMap::new();
         let key = "hello there";
         let value = "value goes here";
         assert!(a.is_empty());
         a.insert(key, value);
         assert_eq!(a.len(), 1);
-        assert_eq!(a[key], value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(value));
 
         match a.entry(key) {
             Vacant(_) => panic!(),
             Occupied(e) => assert_eq!(key, *e.key()),
         }
         assert_eq!(a.len(), 1);
-        assert_eq!(a[key], value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(value));
     }
 
     #[test]
     fn test_occupied_entry_ref_key() {
-        let mut a = HashMap::new();
+        let mut a = CowHashMap::new();
         let key = "hello there";
         let value = "value goes here";
         assert!(a.is_empty());
         a.insert(key.to_owned(), value);
         assert_eq!(a.len(), 1);
-        assert_eq!(a[key], value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(value));
 
         match a.entry_ref(key) {
             EntryRef::Vacant(_) => panic!(),
             EntryRef::Occupied(e) => assert_eq!(key, e.key()),
         }
         assert_eq!(a.len(), 1);
-        assert_eq!(a[key], value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(value));
     }
 
     #[test]
     fn test_vacant_entry_key() {
-        let mut a = HashMap::new();
+        let a = CowHashMap::new();
         let key = "hello there";
         let value = "value goes here";
 
@@ -7774,12 +7384,12 @@ mod test_map {
             }
         }
         assert_eq!(a.len(), 1);
-        assert_eq!(a[key], value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(value));
     }
 
     #[test]
     fn test_vacant_entry_ref_key() {
-        let mut a: HashMap<std::string::String, &str> = HashMap::new();
+        let mut a: CowHashMap<std::string::String, &str> = CowHashMap::new();
         let key = "hello there";
         let value = "value goes here";
 
@@ -7792,12 +7402,12 @@ mod test_map {
             }
         }
         assert_eq!(a.len(), 1);
-        assert_eq!(a[key], value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(value));
     }
 
     #[test]
     fn test_occupied_entry_replace_entry_with() {
-        let mut a = HashMap::new();
+        let a = CowHashMap::new();
 
         let key = "a key";
         let value = "an initial value";
@@ -7805,25 +7415,25 @@ mod test_map {
 
         let entry = a.entry(key).insert(value).replace_entry_with(|k, v| {
             assert_eq!(k, &key);
-            assert_eq!(v, value);
+            assert_eq!(v, &value);
             Some(new_value)
         });
 
         match entry {
             Occupied(e) => {
                 assert_eq!(e.key(), &key);
-                assert_eq!(e.get(), &new_value);
+                assert_eq!(e.get(), new_value);
             }
             Vacant(_) => panic!(),
         }
 
-        assert_eq!(a[key], new_value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(new_value));
         assert_eq!(a.len(), 1);
 
         let entry = match a.entry(key) {
             Occupied(e) => e.replace_entry_with(|k, v| {
                 assert_eq!(k, &key);
-                assert_eq!(v, new_value);
+                assert_eq!(v, &new_value);
                 None
             }),
             Vacant(_) => panic!(),
@@ -7840,7 +7450,7 @@ mod test_map {
 
     #[test]
     fn test_occupied_entry_ref_replace_entry_with() {
-        let mut a: HashMap<std::string::String, &str> = HashMap::new();
+        let mut a: CowHashMap<std::string::String, &str> = CowHashMap::new();
 
         let key = "a key";
         let value = "an initial value";
@@ -7848,25 +7458,25 @@ mod test_map {
 
         let entry = a.entry_ref(key).insert(value).replace_entry_with(|k, v| {
             assert_eq!(k, key);
-            assert_eq!(v, value);
+            assert_eq!(v, &value);
             Some(new_value)
         });
 
         match entry {
             EntryRef::Occupied(e) => {
                 assert_eq!(e.key(), key);
-                assert_eq!(e.get(), &new_value);
+                assert_eq!(e.get(), Arc::new(new_value));
             }
             EntryRef::Vacant(_) => panic!(),
         }
 
-        assert_eq!(a[key], new_value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(new_value));
         assert_eq!(a.len(), 1);
 
         let entry = match a.entry_ref(key) {
             EntryRef::Occupied(e) => e.replace_entry_with(|k, v| {
                 assert_eq!(k, key);
-                assert_eq!(v, new_value);
+                assert_eq!(v, &new_value);
                 None
             }),
             EntryRef::Vacant(_) => panic!(),
@@ -7883,7 +7493,7 @@ mod test_map {
 
     #[test]
     fn test_entry_and_replace_entry_with() {
-        let mut a = HashMap::new();
+        let mut a = CowHashMap::new();
 
         let key = "a key";
         let value = "an initial value";
@@ -7900,24 +7510,24 @@ mod test_map {
 
         let entry = a.entry(key).and_replace_entry_with(|k, v| {
             assert_eq!(k, &key);
-            assert_eq!(v, value);
+            assert_eq!(v, &value);
             Some(new_value)
         });
 
         match entry {
             Occupied(e) => {
                 assert_eq!(e.key(), &key);
-                assert_eq!(e.get(), &new_value);
+                assert_eq!(e.get(), new_value);
             }
             Vacant(_) => panic!(),
         }
 
-        assert_eq!(a[key], new_value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(new_value));
         assert_eq!(a.len(), 1);
 
         let entry = a.entry(key).and_replace_entry_with(|k, v| {
             assert_eq!(k, &key);
-            assert_eq!(v, new_value);
+            assert_eq!(v, &new_value);
             None
         });
 
@@ -7932,7 +7542,7 @@ mod test_map {
 
     #[test]
     fn test_entry_ref_and_replace_entry_with() {
-        let mut a = HashMap::new();
+        let mut a = CowHashMap::new();
 
         let key = "a key";
         let value = "an initial value";
@@ -7949,24 +7559,24 @@ mod test_map {
 
         let entry = a.entry_ref(key).and_replace_entry_with(|k, v| {
             assert_eq!(k, key);
-            assert_eq!(v, value);
+            assert_eq!(v, &value);
             Some(new_value)
         });
 
         match entry {
             EntryRef::Occupied(e) => {
                 assert_eq!(e.key(), key);
-                assert_eq!(e.get(), &new_value);
+                assert_eq!(e.get(), Arc::new(new_value));
             }
             EntryRef::Vacant(_) => panic!(),
         }
 
-        assert_eq!(a[key], new_value);
+        assert_eq!(a.get(key).unwrap(), Arc::new(new_value));
         assert_eq!(a.len(), 1);
 
         let entry = a.entry_ref(key).and_replace_entry_with(|k, v| {
             assert_eq!(k, key);
-            assert_eq!(v, new_value);
+            assert_eq!(v, &new_value);
             None
         });
 
@@ -7980,121 +7590,16 @@ mod test_map {
     }
 
     #[test]
-    fn test_raw_occupied_entry_replace_entry_with() {
-        let mut a = HashMap::new();
-
-        let key = "a key";
-        let value = "an initial value";
-        let new_value = "a new value";
-
-        let entry = a
-            .raw_entry_mut()
-            .from_key(&key)
-            .insert(key, value)
-            .replace_entry_with(|k, v| {
-                assert_eq!(k, &key);
-                assert_eq!(v, value);
-                Some(new_value)
-            });
-
-        match entry {
-            RawEntryMut::Occupied(e) => {
-                assert_eq!(e.key(), &key);
-                assert_eq!(e.get(), &new_value);
-            }
-            RawEntryMut::Vacant(_) => panic!(),
-        }
-
-        assert_eq!(a[key], new_value);
-        assert_eq!(a.len(), 1);
-
-        let entry = match a.raw_entry_mut().from_key(&key) {
-            RawEntryMut::Occupied(e) => e.replace_entry_with(|k, v| {
-                assert_eq!(k, &key);
-                assert_eq!(v, new_value);
-                None
-            }),
-            RawEntryMut::Vacant(_) => panic!(),
-        };
-
-        match entry {
-            RawEntryMut::Vacant(_) => {}
-            RawEntryMut::Occupied(_) => panic!(),
-        }
-
-        assert!(!a.contains_key(key));
-        assert_eq!(a.len(), 0);
-    }
-
-    #[test]
-    fn test_raw_entry_and_replace_entry_with() {
-        let mut a = HashMap::new();
-
-        let key = "a key";
-        let value = "an initial value";
-        let new_value = "a new value";
-
-        let entry = a
-            .raw_entry_mut()
-            .from_key(&key)
-            .and_replace_entry_with(|_, _| panic!());
-
-        match entry {
-            RawEntryMut::Vacant(_) => {}
-            RawEntryMut::Occupied(_) => panic!(),
-        }
-
-        a.insert(key, value);
-
-        let entry = a
-            .raw_entry_mut()
-            .from_key(&key)
-            .and_replace_entry_with(|k, v| {
-                assert_eq!(k, &key);
-                assert_eq!(v, value);
-                Some(new_value)
-            });
-
-        match entry {
-            RawEntryMut::Occupied(e) => {
-                assert_eq!(e.key(), &key);
-                assert_eq!(e.get(), &new_value);
-            }
-            RawEntryMut::Vacant(_) => panic!(),
-        }
-
-        assert_eq!(a[key], new_value);
-        assert_eq!(a.len(), 1);
-
-        let entry = a
-            .raw_entry_mut()
-            .from_key(&key)
-            .and_replace_entry_with(|k, v| {
-                assert_eq!(k, &key);
-                assert_eq!(v, new_value);
-                None
-            });
-
-        match entry {
-            RawEntryMut::Vacant(_) => {}
-            RawEntryMut::Occupied(_) => panic!(),
-        }
-
-        assert!(!a.contains_key(key));
-        assert_eq!(a.len(), 0);
-    }
-
-    #[test]
     fn test_replace_entry_with_doesnt_corrupt() {
         #![allow(deprecated)] //rand
                               // Test for #19292
-        fn check(m: &HashMap<i32, ()>) {
+        fn check(m: &CowHashMap<i32, ()>) {
             for k in m.keys() {
                 assert!(m.contains_key(k), "{k} is in keys() but not in the map?");
             }
         }
 
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
 
         let mut rng = {
             let seed = u64::from_le_bytes(*b"testseed");
@@ -8118,13 +7623,13 @@ mod test_map {
     fn test_replace_entry_ref_with_doesnt_corrupt() {
         #![allow(deprecated)] //rand
                               // Test for #19292
-        fn check(m: &HashMap<std::string::String, ()>) {
+        fn check(m: &CowHashMap<std::string::String, ()>) {
             for k in m.keys() {
                 assert!(m.contains_key(k), "{k} is in keys() but not in the map?");
             }
         }
 
-        let mut m = HashMap::new();
+        let mut m = CowHashMap::new();
 
         let mut rng = {
             let seed = u64::from_le_bytes(*b"testseed");
@@ -8148,30 +7653,13 @@ mod test_map {
 
     #[test]
     fn test_retain() {
-        let mut map: HashMap<i32, i32> = (0..100).map(|x| (x, x * 10)).collect();
+        let map: CowHashMap<i32, i32> = (0..100).map(|x| (x, x * 10)).collect();
 
         map.retain(|&k, _| k % 2 == 0);
         assert_eq!(map.len(), 50);
-        assert_eq!(map[&2], 20);
-        assert_eq!(map[&4], 40);
-        assert_eq!(map[&6], 60);
-    }
-
-    #[test]
-    fn test_extract_if() {
-        {
-            let mut map: HashMap<i32, i32> = (0..8).map(|x| (x, x * 10)).collect();
-            let drained = map.extract_if(|&k, _| k % 2 == 0);
-            let mut out = drained.collect::<Vec<_>>();
-            out.sort_unstable();
-            assert_eq!(vec![(0, 0), (2, 20), (4, 40), (6, 60)], out);
-            assert_eq!(map.len(), 4);
-        }
-        {
-            let mut map: HashMap<i32, i32> = (0..8).map(|x| (x, x * 10)).collect();
-            map.extract_if(|&k, _| k % 2 == 0).for_each(drop);
-            assert_eq!(map.len(), 4);
-        }
+        assert_eq!(map.get(&2).unwrap(), Arc::new(20));
+        assert_eq!(map.get(&4).unwrap(), Arc::new(40));
+        assert_eq!(map.get(&6).unwrap(), Arc::new(60));
     }
 
     #[test]
@@ -8181,7 +7669,7 @@ mod test_map {
 
         const MAX_ISIZE: usize = isize::MAX as usize;
 
-        let mut empty_bytes: HashMap<u8, u8> = HashMap::new();
+        let empty_bytes: CowHashMap<u8, u8> = CowHashMap::new();
 
         if let Err(CapacityOverflow) = empty_bytes.try_reserve(usize::MAX) {
         } else {
@@ -8197,162 +7685,11 @@ mod test_map {
         } else {
             // This may succeed if there is enough free memory. Attempt to
             // allocate a few more hashmaps to ensure the allocation will fail.
-            let mut empty_bytes2: HashMap<u8, u8> = HashMap::new();
+            let empty_bytes2: CowHashMap<u8, u8> = CowHashMap::new();
             let _ = empty_bytes2.try_reserve(MAX_ISIZE / 5);
-            let mut empty_bytes3: HashMap<u8, u8> = HashMap::new();
+            let empty_bytes3: CowHashMap<u8, u8> = CowHashMap::new();
             let _ = empty_bytes3.try_reserve(MAX_ISIZE / 5);
-            let mut empty_bytes4: HashMap<u8, u8> = HashMap::new();
-            if let Err(AllocError { .. }) = empty_bytes4.try_reserve(MAX_ISIZE / 5) {
-            } else {
-                panic!("isize::MAX / 5 should trigger an OOM!");
-            }
         }
-    }
-
-    #[test]
-    fn test_raw_entry() {
-        use super::RawEntryMut::{Occupied, Vacant};
-
-        let xs = [(1_i32, 10_i32), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
-
-        let mut map: HashMap<_, _> = xs.iter().copied().collect();
-
-        let compute_hash = |map: &HashMap<i32, i32>, k: i32| -> u64 {
-            super::make_hash::<i32, _>(map.hasher(), &k)
-        };
-
-        // Existing key (insert)
-        match map.raw_entry_mut().from_key(&1) {
-            Vacant(_) => unreachable!(),
-            Occupied(mut view) => {
-                assert_eq!(view.get(), &10);
-                assert_eq!(view.insert(100), 10);
-            }
-        }
-        let hash1 = compute_hash(&map, 1);
-        assert_eq!(map.raw_entry().from_key(&1).unwrap(), (&1, &100));
-        assert_eq!(
-            map.raw_entry().from_hash(hash1, |k| *k == 1).unwrap(),
-            (&1, &100)
-        );
-        assert_eq!(
-            map.raw_entry().from_key_hashed_nocheck(hash1, &1).unwrap(),
-            (&1, &100)
-        );
-        assert_eq!(map.len(), 6);
-
-        // Existing key (update)
-        match map.raw_entry_mut().from_key(&2) {
-            Vacant(_) => unreachable!(),
-            Occupied(mut view) => {
-                let v = view.get_mut();
-                let new_v = (*v) * 10;
-                *v = new_v;
-            }
-        }
-        let hash2 = compute_hash(&map, 2);
-        assert_eq!(map.raw_entry().from_key(&2).unwrap(), (&2, &200));
-        assert_eq!(
-            map.raw_entry().from_hash(hash2, |k| *k == 2).unwrap(),
-            (&2, &200)
-        );
-        assert_eq!(
-            map.raw_entry().from_key_hashed_nocheck(hash2, &2).unwrap(),
-            (&2, &200)
-        );
-        assert_eq!(map.len(), 6);
-
-        // Existing key (take)
-        let hash3 = compute_hash(&map, 3);
-        match map.raw_entry_mut().from_key_hashed_nocheck(hash3, &3) {
-            Vacant(_) => unreachable!(),
-            Occupied(view) => {
-                assert_eq!(view.remove_entry(), (3, 30));
-            }
-        }
-        assert_eq!(map.raw_entry().from_key(&3), None);
-        assert_eq!(map.raw_entry().from_hash(hash3, |k| *k == 3), None);
-        assert_eq!(map.raw_entry().from_key_hashed_nocheck(hash3, &3), None);
-        assert_eq!(map.len(), 5);
-
-        // Nonexistent key (insert)
-        match map.raw_entry_mut().from_key(&10) {
-            Occupied(_) => unreachable!(),
-            Vacant(view) => {
-                assert_eq!(view.insert(10, 1000), (&mut 10, &mut 1000));
-            }
-        }
-        assert_eq!(map.raw_entry().from_key(&10).unwrap(), (&10, &1000));
-        assert_eq!(map.len(), 6);
-
-        // Ensure all lookup methods produce equivalent results.
-        for k in 0..12 {
-            let hash = compute_hash(&map, k);
-            let v = map.get(&k).copied();
-            let kv = v.as_ref().map(|v| (&k, v));
-
-            assert_eq!(map.raw_entry().from_key(&k), kv);
-            assert_eq!(map.raw_entry().from_hash(hash, |q| *q == k), kv);
-            assert_eq!(map.raw_entry().from_key_hashed_nocheck(hash, &k), kv);
-
-            match map.raw_entry_mut().from_key(&k) {
-                Occupied(o) => assert_eq!(Some(o.get_key_value()), kv),
-                Vacant(_) => assert_eq!(v, None),
-            }
-            match map.raw_entry_mut().from_key_hashed_nocheck(hash, &k) {
-                Occupied(o) => assert_eq!(Some(o.get_key_value()), kv),
-                Vacant(_) => assert_eq!(v, None),
-            }
-            match map.raw_entry_mut().from_hash(hash, |q| *q == k) {
-                Occupied(o) => assert_eq!(Some(o.get_key_value()), kv),
-                Vacant(_) => assert_eq!(v, None),
-            }
-        }
-    }
-
-    #[test]
-    fn test_key_without_hash_impl() {
-        #[derive(Debug)]
-        struct IntWrapper(u64);
-
-        let mut m: HashMap<IntWrapper, (), ()> = HashMap::default();
-        {
-            assert!(m.raw_entry().from_hash(0, |k| k.0 == 0).is_none());
-        }
-        {
-            let vacant_entry = match m.raw_entry_mut().from_hash(0, |k| k.0 == 0) {
-                RawEntryMut::Occupied(..) => panic!("Found entry for key 0"),
-                RawEntryMut::Vacant(e) => e,
-            };
-            vacant_entry.insert_with_hasher(0, IntWrapper(0), (), |k| k.0);
-        }
-        {
-            assert!(m.raw_entry().from_hash(0, |k| k.0 == 0).is_some());
-            assert!(m.raw_entry().from_hash(1, |k| k.0 == 1).is_none());
-            assert!(m.raw_entry().from_hash(2, |k| k.0 == 2).is_none());
-        }
-        {
-            let vacant_entry = match m.raw_entry_mut().from_hash(1, |k| k.0 == 1) {
-                RawEntryMut::Occupied(..) => panic!("Found entry for key 1"),
-                RawEntryMut::Vacant(e) => e,
-            };
-            vacant_entry.insert_with_hasher(1, IntWrapper(1), (), |k| k.0);
-        }
-        {
-            assert!(m.raw_entry().from_hash(0, |k| k.0 == 0).is_some());
-            assert!(m.raw_entry().from_hash(1, |k| k.0 == 1).is_some());
-            assert!(m.raw_entry().from_hash(2, |k| k.0 == 2).is_none());
-        }
-        {
-            let occupied_entry = match m.raw_entry_mut().from_hash(0, |k| k.0 == 0) {
-                RawEntryMut::Occupied(e) => e,
-                RawEntryMut::Vacant(..) => panic!("Couldn't find entry for key 0"),
-            };
-            occupied_entry.remove();
-        }
-        assert!(m.raw_entry().from_hash(0, |k| k.0 == 0).is_none());
-        assert!(m.raw_entry().from_hash(1, |k| k.0 == 1).is_some());
-        assert!(m.raw_entry().from_hash(2, |k| k.0 == 2).is_none());
     }
 
     #[test]
@@ -8365,7 +7702,7 @@ mod test_map {
 
         let mut rng = rand::thread_rng();
         for n in 0..N {
-            let mut map = HashMap::new();
+            let mut map = CowHashMap::new();
             for i in 0..n {
                 assert!(map.insert(i, 2 * i).is_none());
             }
@@ -8424,59 +7761,6 @@ mod test_map {
     }
 
     #[test]
-    fn test_const_with_hasher() {
-        use core::hash::BuildHasher;
-        use std::collections::hash_map::DefaultHasher;
-
-        #[derive(Clone)]
-        struct MyHasher;
-        impl BuildHasher for MyHasher {
-            type Hasher = DefaultHasher;
-
-            fn build_hasher(&self) -> DefaultHasher {
-                DefaultHasher::new()
-            }
-        }
-
-        const EMPTY_MAP: HashMap<u32, std::string::String, MyHasher> =
-            HashMap::with_hasher(MyHasher);
-
-        let mut map = EMPTY_MAP;
-        map.insert(17, "seventeen".to_owned());
-        assert_eq!("seventeen", map[&17]);
-    }
-
-    #[test]
-    fn test_get_each_mut() {
-        let mut map = HashMap::new();
-        map.insert("foo".to_owned(), 0);
-        map.insert("bar".to_owned(), 10);
-        map.insert("baz".to_owned(), 20);
-        map.insert("qux".to_owned(), 30);
-
-        let xs = map.get_many_mut(["foo", "qux"]);
-        assert_eq!(xs, Some([&mut 0, &mut 30]));
-
-        let xs = map.get_many_mut(["foo", "dud"]);
-        assert_eq!(xs, None);
-
-        let xs = map.get_many_mut(["foo", "foo"]);
-        assert_eq!(xs, None);
-
-        let ys = map.get_many_key_value_mut(["bar", "baz"]);
-        assert_eq!(
-            ys,
-            Some([(&"bar".to_owned(), &mut 10), (&"baz".to_owned(), &mut 20),]),
-        );
-
-        let ys = map.get_many_key_value_mut(["bar", "dip"]);
-        assert_eq!(ys, None);
-
-        let ys = map.get_many_key_value_mut(["baz", "baz"]);
-        assert_eq!(ys, None);
-    }
-
-    #[test]
     #[should_panic = "panic in drop"]
     fn test_clone_from_double_drop() {
         #[derive(Clone)]
@@ -8505,64 +7789,19 @@ mod test_map {
             dropped: false,
         };
 
-        let mut map1 = HashMap::new();
+        let mut map1 = CowHashMap::new();
         map1.insert(1, DISARMED);
         map1.insert(2, DISARMED);
         map1.insert(3, DISARMED);
         map1.insert(4, DISARMED);
 
-        let mut map2 = HashMap::new();
+        let mut map2 = CowHashMap::new();
         map2.insert(1, DISARMED);
         map2.insert(2, ARMED);
         map2.insert(3, DISARMED);
         map2.insert(4, DISARMED);
 
         map2.clone_from(&map1);
-    }
-
-    #[test]
-    #[should_panic = "panic in clone"]
-    fn test_clone_from_memory_leaks() {
-        use alloc::vec::Vec;
-
-        struct CheckedClone {
-            panic_in_clone: bool,
-            need_drop: Vec<i32>,
-        }
-        impl Clone for CheckedClone {
-            fn clone(&self) -> Self {
-                if self.panic_in_clone {
-                    panic!("panic in clone")
-                }
-                Self {
-                    panic_in_clone: self.panic_in_clone,
-                    need_drop: self.need_drop.clone(),
-                }
-            }
-        }
-        let mut map1 = HashMap::new();
-        map1.insert(
-            1,
-            CheckedClone {
-                panic_in_clone: false,
-                need_drop: vec![0, 1, 2],
-            },
-        );
-        map1.insert(
-            2,
-            CheckedClone {
-                panic_in_clone: false,
-                need_drop: vec![3, 4, 5],
-            },
-        );
-        map1.insert(
-            3,
-            CheckedClone {
-                panic_in_clone: true,
-                need_drop: vec![6, 7, 8],
-            },
-        );
-        let _map2 = map1.clone();
     }
 
     struct MyAllocInner {
@@ -8606,7 +7845,7 @@ mod test_map {
         let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(1));
 
         {
-            let mut map = HashMap::with_capacity_in(10, MyAlloc::new(dropped.clone()));
+            let map = CowHashMap::with_capacity_in(10, MyAlloc::new(dropped.clone()));
             for i in 0..10 {
                 map.entry(i).or_insert_with(|| "i".to_string());
             }
@@ -8620,6 +7859,7 @@ mod test_map {
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
     }
 
+    #[allow(dead_code)]
     #[derive(Debug)]
     struct CheckedCloneDrop<T> {
         panic_in_clone: bool,
@@ -8629,6 +7869,7 @@ mod test_map {
     }
 
     impl<T> CheckedCloneDrop<T> {
+        #[allow(dead_code)]
         fn new(panic_in_clone: bool, panic_in_drop: bool, data: T) -> Self {
             CheckedCloneDrop {
                 panic_in_clone,
@@ -8664,296 +7905,5 @@ mod test_map {
             }
             self.dropped = true;
         }
-    }
-
-    /// Return hashmap with predefined distribution of elements.
-    /// All elements will be located in the same order as elements
-    /// returned by iterator.
-    ///
-    /// This function does not panic, but returns an error as a `String`
-    /// to distinguish between a test panic and an error in the input data.
-    fn get_test_map<I, T, A>(
-        iter: I,
-        mut fun: impl FnMut(u64) -> T,
-        alloc: A,
-    ) -> Result<HashMap<u64, CheckedCloneDrop<T>, DefaultHashBuilder, A>, String>
-    where
-        I: Iterator<Item = (bool, bool)> + Clone + ExactSizeIterator,
-        A: Allocator,
-        T: PartialEq + core::fmt::Debug,
-    {
-        use crate::scopeguard::guard;
-
-        let mut map: HashMap<u64, CheckedCloneDrop<T>, _, A> =
-            HashMap::with_capacity_in(iter.size_hint().0, alloc);
-        {
-            let mut guard = guard(&mut map, |map| {
-                for (_, value) in map.iter_mut() {
-                    value.panic_in_drop = false
-                }
-            });
-
-            let mut count = 0;
-            // Hash and Key must be equal to each other for controlling the elements placement.
-            for (panic_in_clone, panic_in_drop) in iter.clone() {
-                if core::mem::needs_drop::<T>() && panic_in_drop {
-                    return Err(String::from(
-                        "panic_in_drop can be set with a type that doesn't need to be dropped",
-                    ));
-                }
-                guard.table.insert(
-                    count,
-                    (
-                        count,
-                        CheckedCloneDrop::new(panic_in_clone, panic_in_drop, fun(count)),
-                    ),
-                    |(k, _)| *k,
-                );
-                count += 1;
-            }
-
-            // Let's check that all elements are located as we wanted
-            let mut check_count = 0;
-            for ((key, value), (panic_in_clone, panic_in_drop)) in guard.iter().zip(iter) {
-                if *key != check_count {
-                    return Err(format!(
-                        "key != check_count,\nkey: `{}`,\ncheck_count: `{}`",
-                        key, check_count
-                    ));
-                }
-                if value.dropped
-                    || value.panic_in_clone != panic_in_clone
-                    || value.panic_in_drop != panic_in_drop
-                    || value.data != fun(check_count)
-                {
-                    return Err(format!(
-                        "Value is not equal to expected,\nvalue: `{:?}`,\nexpected: \
-                        `CheckedCloneDrop {{ panic_in_clone: {}, panic_in_drop: {}, dropped: {}, data: {:?} }}`",
-                        value, panic_in_clone, panic_in_drop, false, fun(check_count)
-                    ));
-                }
-                check_count += 1;
-            }
-
-            if guard.len() != check_count as usize {
-                return Err(format!(
-                    "map.len() != check_count,\nmap.len(): `{}`,\ncheck_count: `{}`",
-                    guard.len(),
-                    check_count
-                ));
-            }
-
-            if count != check_count {
-                return Err(format!(
-                    "count != check_count,\ncount: `{}`,\ncheck_count: `{}`",
-                    count, check_count
-                ));
-            }
-            core::mem::forget(guard);
-        }
-        Ok(map)
-    }
-
-    const DISARMED: bool = false;
-    const ARMED: bool = true;
-
-    const ARMED_FLAGS: [bool; 8] = [
-        DISARMED, DISARMED, DISARMED, ARMED, DISARMED, DISARMED, DISARMED, DISARMED,
-    ];
-
-    const DISARMED_FLAGS: [bool; 8] = [
-        DISARMED, DISARMED, DISARMED, DISARMED, DISARMED, DISARMED, DISARMED, DISARMED,
-    ];
-
-    #[test]
-    #[should_panic = "panic in clone"]
-    fn test_clone_memory_leaks_and_double_drop_one() {
-        let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(2));
-
-        {
-            assert_eq!(ARMED_FLAGS.len(), DISARMED_FLAGS.len());
-
-            let map: HashMap<u64, CheckedCloneDrop<Vec<u64>>, DefaultHashBuilder, MyAlloc> =
-                match get_test_map(
-                    ARMED_FLAGS.into_iter().zip(DISARMED_FLAGS),
-                    |n| vec![n],
-                    MyAlloc::new(dropped.clone()),
-                ) {
-                    Ok(map) => map,
-                    Err(msg) => panic!("{msg}"),
-                };
-
-            // Clone should normally clone a few elements, and then (when the
-            // clone function panics), deallocate both its own memory, memory
-            // of `dropped: Arc<AtomicI8>` and the memory of already cloned
-            // elements (Vec<i32> memory inside CheckedCloneDrop).
-            let _map2 = map.clone();
-        }
-    }
-
-    #[test]
-    #[should_panic = "panic in drop"]
-    fn test_clone_memory_leaks_and_double_drop_two() {
-        let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(2));
-
-        {
-            assert_eq!(ARMED_FLAGS.len(), DISARMED_FLAGS.len());
-
-            let map: HashMap<u64, CheckedCloneDrop<u64>, DefaultHashBuilder, _> = match get_test_map(
-                DISARMED_FLAGS.into_iter().zip(DISARMED_FLAGS),
-                |n| n,
-                MyAlloc::new(dropped.clone()),
-            ) {
-                Ok(map) => map,
-                Err(msg) => panic!("{msg}"),
-            };
-
-            let mut map2 = match get_test_map(
-                DISARMED_FLAGS.into_iter().zip(ARMED_FLAGS),
-                |n| n,
-                MyAlloc::new(dropped.clone()),
-            ) {
-                Ok(map) => map,
-                Err(msg) => panic!("{msg}"),
-            };
-
-            // The `clone_from` should try to drop the elements of `map2` without
-            // double drop and leaking the allocator. Elements that have not been
-            // dropped leak their memory.
-            map2.clone_from(&map);
-        }
-    }
-
-    /// We check that we have a working table if the clone operation from another
-    /// thread ended in a panic (when buckets of maps are equal to each other).
-    #[test]
-    fn test_catch_panic_clone_from_when_len_is_equal() {
-        use std::thread;
-
-        let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(2));
-
-        {
-            assert_eq!(ARMED_FLAGS.len(), DISARMED_FLAGS.len());
-
-            let mut map = match get_test_map(
-                DISARMED_FLAGS.into_iter().zip(DISARMED_FLAGS),
-                |n| vec![n],
-                MyAlloc::new(dropped.clone()),
-            ) {
-                Ok(map) => map,
-                Err(msg) => panic!("{msg}"),
-            };
-
-            thread::scope(|s| {
-                let result: thread::ScopedJoinHandle<'_, String> = s.spawn(|| {
-                    let scope_map =
-                        match get_test_map(ARMED_FLAGS.into_iter().zip(DISARMED_FLAGS), |n| vec![n * 2], MyAlloc::new(dropped.clone())) {
-                            Ok(map) => map,
-                            Err(msg) => return msg,
-                        };
-                    if map.table.buckets() != scope_map.table.buckets() {
-                        return format!(
-                            "map.table.buckets() != scope_map.table.buckets(),\nleft: `{}`,\nright: `{}`",
-                            map.table.buckets(), scope_map.table.buckets()
-                        );
-                    }
-                    map.clone_from(&scope_map);
-                    "We must fail the cloning!!!".to_owned()
-                });
-                if let Ok(msg) = result.join() {
-                    panic!("{msg}")
-                }
-            });
-
-            // Let's check that all iterators work fine and do not return elements
-            // (especially `RawIterRange`, which does not depend on the number of
-            // elements in the table, but looks directly at the control bytes)
-            //
-            // SAFETY: We know for sure that `RawTable` will outlive
-            // the returned `RawIter / RawIterRange` iterator.
-            assert_eq!(map.len(), 0);
-            assert_eq!(map.iter().count(), 0);
-            assert_eq!(unsafe { map.table.iter().count() }, 0);
-            assert_eq!(unsafe { map.table.iter().iter.count() }, 0);
-
-            for idx in 0..map.table.buckets() {
-                let idx = idx as u64;
-                assert!(
-                    map.table.find(idx, |(k, _)| *k == idx).is_none(),
-                    "Index: {idx}"
-                );
-            }
-        }
-
-        // All allocator clones should already be dropped.
-        assert_eq!(dropped.load(Ordering::SeqCst), 0);
-    }
-
-    /// We check that we have a working table if the clone operation from another
-    /// thread ended in a panic (when buckets of maps are not equal to each other).
-    #[test]
-    fn test_catch_panic_clone_from_when_len_is_not_equal() {
-        use std::thread;
-
-        let dropped: Arc<AtomicI8> = Arc::new(AtomicI8::new(2));
-
-        {
-            assert_eq!(ARMED_FLAGS.len(), DISARMED_FLAGS.len());
-
-            let mut map = match get_test_map(
-                [DISARMED].into_iter().zip([DISARMED]),
-                |n| vec![n],
-                MyAlloc::new(dropped.clone()),
-            ) {
-                Ok(map) => map,
-                Err(msg) => panic!("{msg}"),
-            };
-
-            thread::scope(|s| {
-                let result: thread::ScopedJoinHandle<'_, String> = s.spawn(|| {
-                    let scope_map = match get_test_map(
-                        ARMED_FLAGS.into_iter().zip(DISARMED_FLAGS),
-                        |n| vec![n * 2],
-                        MyAlloc::new(dropped.clone()),
-                    ) {
-                        Ok(map) => map,
-                        Err(msg) => return msg,
-                    };
-                    if map.table.buckets() == scope_map.table.buckets() {
-                        return format!(
-                            "map.table.buckets() == scope_map.table.buckets(): `{}`",
-                            map.table.buckets()
-                        );
-                    }
-                    map.clone_from(&scope_map);
-                    "We must fail the cloning!!!".to_owned()
-                });
-                if let Ok(msg) = result.join() {
-                    panic!("{msg}")
-                }
-            });
-
-            // Let's check that all iterators work fine and do not return elements
-            // (especially `RawIterRange`, which does not depend on the number of
-            // elements in the table, but looks directly at the control bytes)
-            //
-            // SAFETY: We know for sure that `RawTable` will outlive
-            // the returned `RawIter / RawIterRange` iterator.
-            assert_eq!(map.len(), 0);
-            assert_eq!(map.iter().count(), 0);
-            assert_eq!(unsafe { map.table.iter().count() }, 0);
-            assert_eq!(unsafe { map.table.iter().iter.count() }, 0);
-
-            for idx in 0..map.table.buckets() {
-                let idx = idx as u64;
-                assert!(
-                    map.table.find(idx, |(k, _)| *k == idx).is_none(),
-                    "Index: {idx}"
-                );
-            }
-        }
-
-        // All allocator clones should already be dropped.
-        assert_eq!(dropped.load(Ordering::SeqCst), 0);
     }
 }

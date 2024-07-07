@@ -9,7 +9,7 @@
 
 extern crate test;
 
-use hashbrown::HashSet;
+use cow_hashbrown::HashSet;
 use test::Bencher;
 
 /// The number of items to generate for the larger of the sets.

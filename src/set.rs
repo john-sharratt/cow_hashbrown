@@ -7,7 +7,7 @@ use core::hash::{BuildHasher, Hash};
 use core::iter::{Chain, FusedIterator};
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Sub, SubAssign};
 
-use super::map::{self, HashMap, Keys};
+use super::map::{self, CowHashMap, Keys};
 use crate::raw::{Allocator, Global, RawExtractIf};
 use crate::DefaultHashBuilder;
 
@@ -46,7 +46,7 @@ use crate::DefaultHashBuilder;
 /// # Examples
 ///
 /// ```
-/// use hashbrown::HashSet;
+/// use cow_hashbrown::HashSet;
 /// // Type inference lets us omit an explicit type signature (which
 /// // would be `HashSet<String>` in this example).
 /// let mut books = HashSet::new();
@@ -77,7 +77,7 @@ use crate::DefaultHashBuilder;
 /// future be implied by [`Eq`].
 ///
 /// ```
-/// use hashbrown::HashSet;
+/// use cow_hashbrown::HashSet;
 /// #[derive(Hash, Eq, PartialEq, Debug)]
 /// struct Viking {
 ///     name: String,
@@ -100,7 +100,7 @@ use crate::DefaultHashBuilder;
 /// A `HashSet` with fixed list of elements can be initialized from an array:
 ///
 /// ```
-/// use hashbrown::HashSet;
+/// use cow_hashbrown::HashSet;
 ///
 /// let viking_names: HashSet<&'static str> =
 ///     [ "Einar", "Olaf", "Harald" ].into_iter().collect();
@@ -113,8 +113,8 @@ use crate::DefaultHashBuilder;
 /// [`HashMap`]: struct.HashMap.html
 /// [`PartialEq`]: https://doc.rust-lang.org/std/cmp/trait.PartialEq.html
 /// [`RefCell`]: https://doc.rust-lang.org/std/cell/struct.RefCell.html
-pub struct HashSet<T, S = DefaultHashBuilder, A: Allocator = Global> {
-    pub(crate) map: HashMap<T, (), S, A>,
+pub struct HashSet<T: Clone, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
+    pub(crate) map: CowHashMap<T, (), S, A>,
 }
 
 impl<T: Clone, S: Clone, A: Allocator + Clone> Clone for HashSet<T, S, A> {
@@ -130,7 +130,7 @@ impl<T: Clone, S: Clone, A: Allocator + Clone> Clone for HashSet<T, S, A> {
 }
 
 #[cfg(feature = "default-hasher")]
-impl<T> HashSet<T, DefaultHashBuilder> {
+impl<T: Clone> HashSet<T, DefaultHashBuilder> {
     /// Creates an empty `HashSet`.
     ///
     /// The hash set is initially created with a capacity of 0, so it will not allocate until it
@@ -151,13 +151,13 @@ impl<T> HashSet<T, DefaultHashBuilder> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let set: HashSet<i32> = HashSet::new();
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: CowHashMap::new(),
         }
     }
 
@@ -181,20 +181,20 @@ impl<T> HashSet<T, DefaultHashBuilder> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let set: HashSet<i32> = HashSet::with_capacity(10);
     /// assert!(set.capacity() >= 10);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            map: HashMap::with_capacity(capacity),
+            map: CowHashMap::with_capacity(capacity),
         }
     }
 }
 
 #[cfg(feature = "default-hasher")]
-impl<T: Hash + Eq, A: Allocator> HashSet<T, DefaultHashBuilder, A> {
+impl<T: Clone + Hash + Eq, A: Allocator + Clone> HashSet<T, DefaultHashBuilder, A> {
     /// Creates an empty `HashSet`.
     ///
     /// The hash set is initially created with a capacity of 0, so it will not allocate until it
@@ -215,13 +215,13 @@ impl<T: Hash + Eq, A: Allocator> HashSet<T, DefaultHashBuilder, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let set: HashSet<i32> = HashSet::new();
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn new_in(alloc: A) -> Self {
         Self {
-            map: HashMap::new_in(alloc),
+            map: CowHashMap::new_in(alloc),
         }
     }
 
@@ -245,25 +245,25 @@ impl<T: Hash + Eq, A: Allocator> HashSet<T, DefaultHashBuilder, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let set: HashSet<i32> = HashSet::with_capacity(10);
     /// assert!(set.capacity() >= 10);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
         Self {
-            map: HashMap::with_capacity_in(capacity, alloc),
+            map: CowHashMap::with_capacity_in(capacity, alloc),
         }
     }
 }
 
-impl<T, S, A: Allocator> HashSet<T, S, A> {
+impl<T: Clone, S, A: Allocator + Clone> HashSet<T, S, A> {
     /// Returns the number of elements the set can hold without reallocating.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let set: HashSet<i32> = HashSet::with_capacity(100);
     /// assert!(set.capacity() >= 100);
     /// ```
@@ -278,7 +278,7 @@ impl<T, S, A: Allocator> HashSet<T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let mut set = HashSet::new();
     /// set.insert("a");
     /// set.insert("b");
@@ -300,7 +300,7 @@ impl<T, S, A: Allocator> HashSet<T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut v = HashSet::new();
     /// assert_eq!(v.len(), 0);
@@ -317,7 +317,7 @@ impl<T, S, A: Allocator> HashSet<T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut v = HashSet::new();
     /// assert!(v.is_empty());
@@ -334,7 +334,7 @@ impl<T, S, A: Allocator> HashSet<T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// assert!(!set.is_empty());
@@ -360,7 +360,7 @@ impl<T, S, A: Allocator> HashSet<T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let xs = [1,2,3,4,5,6];
     /// let mut set: HashSet<i32> = xs.into_iter().collect();
@@ -389,7 +389,7 @@ impl<T, S, A: Allocator> HashSet<T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<i32> = (0..8).collect();
     /// let drained: HashSet<i32> = set.extract_if(|v| v % 2 == 0).collect();
@@ -421,7 +421,7 @@ impl<T, S, A: Allocator> HashSet<T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut v = HashSet::new();
     /// v.insert(1);
@@ -434,7 +434,7 @@ impl<T, S, A: Allocator> HashSet<T, S, A> {
     }
 }
 
-impl<T, S> HashSet<T, S, Global> {
+impl<T: Clone, S> HashSet<T, S, Global> {
     /// Creates a new empty hash set which will use the given hasher to hash
     /// keys.
     ///
@@ -459,17 +459,17 @@ impl<T, S> HashSet<T, S, Global> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::HashSet;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let s = DefaultHashBuilder::default();
     /// let mut set = HashSet::with_hasher(s);
     /// set.insert(2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub const fn with_hasher(hasher: S) -> Self {
+    pub fn with_hasher(hasher: S) -> Self {
         Self {
-            map: HashMap::with_hasher(hasher),
+            map: CowHashMap::with_hasher(hasher),
         }
     }
 
@@ -497,8 +497,8 @@ impl<T, S> HashSet<T, S, Global> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::HashSet;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let s = DefaultHashBuilder::default();
     /// let mut set = HashSet::with_capacity_and_hasher(10, s);
@@ -507,14 +507,14 @@ impl<T, S> HashSet<T, S, Global> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
         Self {
-            map: HashMap::with_capacity_and_hasher(capacity, hasher),
+            map: CowHashMap::with_capacity_and_hasher(capacity, hasher),
         }
     }
 }
 
-impl<T, S, A> HashSet<T, S, A>
+impl<T: Clone, S, A> HashSet<T, S, A>
 where
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Returns a reference to the underlying allocator.
     #[inline]
@@ -546,8 +546,8 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::HashSet;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let s = DefaultHashBuilder::default();
     /// let mut set = HashSet::with_hasher(s);
@@ -556,7 +556,7 @@ where
     #[cfg_attr(feature = "inline-more", inline)]
     pub const fn with_hasher_in(hasher: S, alloc: A) -> Self {
         Self {
-            map: HashMap::with_hasher_in(hasher, alloc),
+            map: CowHashMap::with_hasher_in(hasher, alloc),
         }
     }
 
@@ -584,8 +584,8 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::HashSet;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let s = DefaultHashBuilder::default();
     /// let mut set = HashSet::with_capacity_and_hasher(10, s);
@@ -594,7 +594,7 @@ where
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn with_capacity_and_hasher_in(capacity: usize, hasher: S, alloc: A) -> Self {
         Self {
-            map: HashMap::with_capacity_and_hasher_in(capacity, hasher, alloc),
+            map: CowHashMap::with_capacity_and_hasher_in(capacity, hasher, alloc),
         }
     }
 
@@ -605,8 +605,8 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
-    /// use hashbrown::DefaultHashBuilder;
+    /// use cow_hashbrown::HashSet;
+    /// use cow_hashbrown::DefaultHashBuilder;
     ///
     /// let hasher = DefaultHashBuilder::default();
     /// let set: HashSet<i32> = HashSet::with_hasher(hasher);
@@ -618,11 +618,11 @@ where
     }
 }
 
-impl<T, S, A> HashSet<T, S, A>
+impl<T: Clone, S, A> HashSet<T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Reserves capacity for at least `additional` more elements to be inserted
     /// in the `HashSet`. The collection may reserve more space to avoid
@@ -640,7 +640,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let mut set: HashSet<i32> = HashSet::new();
     /// set.reserve(10);
     /// assert!(set.capacity() >= 10);
@@ -662,7 +662,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let mut set: HashSet<i32> = HashSet::new();
     /// set.try_reserve(10).expect("why is the test harness OOMing on 10 bytes?");
     /// ```
@@ -678,7 +678,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set = HashSet::with_capacity(100);
     /// set.insert(1);
@@ -702,7 +702,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set = HashSet::with_capacity(100);
     /// set.insert(1);
@@ -724,7 +724,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let a: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = [4, 2, 3, 4].into_iter().collect();
     ///
@@ -755,7 +755,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let a: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = [4, 2, 3, 4].into_iter().collect();
     ///
@@ -783,7 +783,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let a: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = [4, 2, 3, 4].into_iter().collect();
     ///
@@ -814,7 +814,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let a: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = [4, 2, 3, 4].into_iter().collect();
     ///
@@ -849,7 +849,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let set: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// assert_eq!(set.contains(&1), true);
@@ -875,7 +875,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let set: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// assert_eq!(set.get(&2), Some(&2));
@@ -902,7 +902,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// assert_eq!(set.len(), 3);
@@ -927,7 +927,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<String> = ["cat", "dog", "horse"]
     ///     .iter().map(|&pet| pet.to_owned()).collect();
@@ -959,7 +959,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<String> = ["cat", "dog", "horse"]
     ///     .iter().map(|&pet| pet.to_owned()).collect();
@@ -991,8 +991,8 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
-    /// use hashbrown::hash_set::Entry::*;
+    /// use cow_hashbrown::HashSet;
+    /// use cow_hashbrown::hash_set::Entry::*;
     ///
     /// let mut singles = HashSet::new();
     /// let mut dupes = HashSet::new();
@@ -1033,7 +1033,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let a: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// let mut b = HashSet::new();
@@ -1054,7 +1054,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let sup: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// let mut set = HashSet::new();
@@ -1075,7 +1075,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let sub: HashSet<_> = [1, 2].into_iter().collect();
     /// let mut set = HashSet::new();
@@ -1103,7 +1103,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set = HashSet::new();
     ///
@@ -1146,7 +1146,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set = HashSet::new();
     /// set.insert(Vec::<i32>::new());
@@ -1176,7 +1176,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set = HashSet::new();
     ///
@@ -1204,7 +1204,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<_> = [1, 2, 3].into_iter().collect();
     /// assert_eq!(set.take(&2), Some(2));
@@ -1226,7 +1226,7 @@ where
     }
 }
 
-impl<T, S, A: Allocator> HashSet<T, S, A> {
+impl<T: Clone, S, A: Allocator + Clone> HashSet<T, S, A> {
     /// Returns a reference to the [`RawTable`] used underneath [`HashSet`].
     /// This function is only available if the `raw` feature of the crate is enabled.
     ///
@@ -1268,11 +1268,11 @@ impl<T, S, A: Allocator> HashSet<T, S, A> {
     }
 }
 
-impl<T, S, A> PartialEq for HashSet<T, S, A>
+impl<T: Clone, S, A> PartialEq for HashSet<T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
@@ -1283,38 +1283,38 @@ where
     }
 }
 
-impl<T, S, A> Eq for HashSet<T, S, A>
+impl<T: Clone, S, A> Eq for HashSet<T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
 }
 
-impl<T, S, A> fmt::Debug for HashSet<T, S, A>
+impl<T: Clone, S, A> fmt::Debug for HashSet<T, S, A>
 where
     T: fmt::Debug,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.iter()).finish()
     }
 }
 
-impl<T, S, A> From<HashMap<T, (), S, A>> for HashSet<T, S, A>
+impl<T: Clone, S, A> From<CowHashMap<T, (), S, A>> for HashSet<T, S, A>
 where
-    A: Allocator,
+    A: Allocator + Clone,
 {
-    fn from(map: HashMap<T, (), S, A>) -> Self {
+    fn from(map: CowHashMap<T, (), S, A>) -> Self {
         Self { map }
     }
 }
 
-impl<T, S, A> FromIterator<T> for HashSet<T, S, A>
+impl<T: Clone, S, A> FromIterator<T> for HashSet<T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher + Default,
-    A: Default + Allocator,
+    A: Default + Allocator + Clone,
 {
     #[cfg_attr(feature = "inline-more", inline)]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
@@ -1326,15 +1326,15 @@ where
 
 // The default hasher is used to match the std implementation signature
 #[cfg(feature = "default-hasher")]
-impl<T, A, const N: usize> From<[T; N]> for HashSet<T, DefaultHashBuilder, A>
+impl<T: Clone, A, const N: usize> From<[T; N]> for HashSet<T, DefaultHashBuilder, A>
 where
     T: Eq + Hash,
-    A: Default + Allocator,
+    A: Default + Allocator + Clone,
 {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let set1 = HashSet::from([1, 2, 3, 4]);
     /// let set2: HashSet<_> = [1, 2, 3, 4].into();
@@ -1345,11 +1345,11 @@ where
     }
 }
 
-impl<T, S, A> Extend<T> for HashSet<T, S, A>
+impl<T: Clone, S, A> Extend<T> for HashSet<T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     #[cfg_attr(feature = "inline-more", inline)]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
@@ -1369,11 +1369,11 @@ where
     }
 }
 
-impl<'a, T, S, A> Extend<&'a T> for HashSet<T, S, A>
+impl<'a, T: Clone, S, A> Extend<&'a T> for HashSet<T, S, A>
 where
     T: 'a + Eq + Hash + Copy,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     #[cfg_attr(feature = "inline-more", inline)]
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
@@ -1393,25 +1393,25 @@ where
     }
 }
 
-impl<T, S, A> Default for HashSet<T, S, A>
+impl<T: Clone, S, A> Default for HashSet<T, S, A>
 where
     S: Default,
-    A: Default + Allocator,
+    A: Default + Allocator + Clone,
 {
     /// Creates an empty `HashSet<T, S>` with the `Default` value for the hasher.
     #[cfg_attr(feature = "inline-more", inline)]
     fn default() -> Self {
         Self {
-            map: HashMap::default(),
+            map: CowHashMap::default(),
         }
     }
 }
 
-impl<T, S, A> BitOr<&HashSet<T, S, A>> for &HashSet<T, S, A>
+impl<T: Clone, S, A> BitOr<&HashSet<T, S, A>> for &HashSet<T, S, A>
 where
     T: Eq + Hash + Clone,
     S: BuildHasher + Default,
-    A: Allocator + Default,
+    A: Allocator + Default + Clone,
 {
     type Output = HashSet<T, S, A>;
 
@@ -1420,7 +1420,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = vec![3, 4, 5].into_iter().collect();
@@ -1440,11 +1440,11 @@ where
     }
 }
 
-impl<T, S, A> BitAnd<&HashSet<T, S, A>> for &HashSet<T, S, A>
+impl<T: Clone, S, A> BitAnd<&HashSet<T, S, A>> for &HashSet<T, S, A>
 where
     T: Eq + Hash + Clone,
     S: BuildHasher + Default,
-    A: Allocator + Default,
+    A: Allocator + Default + Clone,
 {
     type Output = HashSet<T, S, A>;
 
@@ -1453,7 +1453,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = vec![2, 3, 4].into_iter().collect();
@@ -1473,11 +1473,11 @@ where
     }
 }
 
-impl<T, S, A> BitXor<&HashSet<T, S, A>> for &HashSet<T, S, A>
+impl<T: Clone, S, A> BitXor<&HashSet<T, S, A>> for &HashSet<T, S, A>
 where
     T: Eq + Hash + Clone,
     S: BuildHasher + Default,
-    A: Allocator + Default,
+    A: Allocator + Default + Clone,
 {
     type Output = HashSet<T, S, A>;
 
@@ -1486,7 +1486,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = vec![3, 4, 5].into_iter().collect();
@@ -1506,11 +1506,11 @@ where
     }
 }
 
-impl<T, S, A> Sub<&HashSet<T, S, A>> for &HashSet<T, S, A>
+impl<T: Clone, S, A> Sub<&HashSet<T, S, A>> for &HashSet<T, S, A>
 where
     T: Eq + Hash + Clone,
     S: BuildHasher + Default,
-    A: Allocator + Default,
+    A: Allocator + Default + Clone,
 {
     type Output = HashSet<T, S, A>;
 
@@ -1519,7 +1519,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = vec![3, 4, 5].into_iter().collect();
@@ -1539,18 +1539,18 @@ where
     }
 }
 
-impl<T, S, A> BitOrAssign<&HashSet<T, S, A>> for HashSet<T, S, A>
+impl<T: Clone, S, A> BitOrAssign<&HashSet<T, S, A>> for HashSet<T, S, A>
 where
     T: Eq + Hash + Clone,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Modifies this set to contain the union of `self` and `rhs`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = vec![3, 4, 5].into_iter().collect();
@@ -1574,18 +1574,18 @@ where
     }
 }
 
-impl<T, S, A> BitAndAssign<&HashSet<T, S, A>> for HashSet<T, S, A>
+impl<T: Clone, S, A> BitAndAssign<&HashSet<T, S, A>> for HashSet<T, S, A>
 where
     T: Eq + Hash + Clone,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Modifies this set to contain the intersection of `self` and `rhs`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = vec![2, 3, 4].into_iter().collect();
@@ -1605,18 +1605,18 @@ where
     }
 }
 
-impl<T, S, A> BitXorAssign<&HashSet<T, S, A>> for HashSet<T, S, A>
+impl<T: Clone, S, A> BitXorAssign<&HashSet<T, S, A>> for HashSet<T, S, A>
 where
     T: Eq + Hash + Clone,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Modifies this set to contain the symmetric difference of `self` and `rhs`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = vec![3, 4, 5].into_iter().collect();
@@ -1646,18 +1646,18 @@ where
     }
 }
 
-impl<T, S, A> SubAssign<&HashSet<T, S, A>> for HashSet<T, S, A>
+impl<T: Clone, S, A> SubAssign<&HashSet<T, S, A>> for HashSet<T, S, A>
 where
     T: Eq + Hash + Clone,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     /// Modifies this set to contain the difference of `self` and `rhs`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
     /// let b: HashSet<_> = vec![3, 4, 5].into_iter().collect();
@@ -1739,7 +1739,7 @@ where
 ///
 /// [`HashSet`]: struct.HashSet.html
 /// [`intersection`]: struct.HashSet.html#method.intersection
-pub struct Intersection<'a, T, S, A: Allocator = Global> {
+pub struct Intersection<'a, T: Clone, S, A: Allocator + Clone = Global> {
     // iterator of the first set
     iter: Iter<'a, T>,
     // the second set
@@ -1753,7 +1753,7 @@ pub struct Intersection<'a, T, S, A: Allocator = Global> {
 ///
 /// [`HashSet`]: struct.HashSet.html
 /// [`difference`]: struct.HashSet.html#method.difference
-pub struct Difference<'a, T, S, A: Allocator = Global> {
+pub struct Difference<'a, T: Clone, S, A: Allocator + Clone = Global> {
     // iterator of the first set
     iter: Iter<'a, T>,
     // the second set
@@ -1767,7 +1767,7 @@ pub struct Difference<'a, T, S, A: Allocator = Global> {
 ///
 /// [`HashSet`]: struct.HashSet.html
 /// [`symmetric_difference`]: struct.HashSet.html#method.symmetric_difference
-pub struct SymmetricDifference<'a, T, S, A: Allocator = Global> {
+pub struct SymmetricDifference<'a, T: Clone, S, A: Allocator + Clone = Global> {
     iter: Chain<Difference<'a, T, S, A>, Difference<'a, T, S, A>>,
 }
 
@@ -1778,11 +1778,11 @@ pub struct SymmetricDifference<'a, T, S, A: Allocator = Global> {
 ///
 /// [`HashSet`]: struct.HashSet.html
 /// [`union`]: struct.HashSet.html#method.union
-pub struct Union<'a, T, S, A: Allocator = Global> {
+pub struct Union<'a, T: Clone, S, A: Allocator + Clone = Global> {
     iter: Chain<Iter<'a, T>, Difference<'a, T, S, A>>,
 }
 
-impl<'a, T, S, A: Allocator> IntoIterator for &'a HashSet<T, S, A> {
+impl<'a, T: Clone, S, A: Allocator + Clone> IntoIterator for &'a HashSet<T, S, A> {
     type Item = &'a T;
     type IntoIter = Iter<'a, T>;
 
@@ -1792,7 +1792,7 @@ impl<'a, T, S, A: Allocator> IntoIterator for &'a HashSet<T, S, A> {
     }
 }
 
-impl<T, S, A: Allocator> IntoIterator for HashSet<T, S, A> {
+impl<T: Clone, S, A: Allocator + Clone> IntoIterator for HashSet<T, S, A> {
     type Item = T;
     type IntoIter = IntoIter<T, A>;
 
@@ -1803,7 +1803,7 @@ impl<T, S, A: Allocator> IntoIterator for HashSet<T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     /// let mut set = HashSet::new();
     /// set.insert("a".to_string());
     /// set.insert("b".to_string());
@@ -1965,7 +1965,7 @@ where
 
 impl<K, F, A: Allocator> FusedIterator for ExtractIf<'_, K, F, A> where F: FnMut(&K) -> bool {}
 
-impl<T, S, A: Allocator> Clone for Intersection<'_, T, S, A> {
+impl<T: Clone, S, A: Allocator + Clone> Clone for Intersection<'_, T, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         Intersection {
@@ -1975,11 +1975,11 @@ impl<T, S, A: Allocator> Clone for Intersection<'_, T, S, A> {
     }
 }
 
-impl<'a, T, S, A> Iterator for Intersection<'a, T, S, A>
+impl<'a, T: Clone, S, A> Iterator for Intersection<'a, T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     type Item = &'a T;
 
@@ -2015,26 +2015,26 @@ where
     }
 }
 
-impl<T, S, A> fmt::Debug for Intersection<'_, T, S, A>
+impl<T: Clone, S, A> fmt::Debug for Intersection<'_, T, S, A>
 where
     T: fmt::Debug + Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
 }
 
-impl<T, S, A> FusedIterator for Intersection<'_, T, S, A>
+impl<T: Clone, S, A> FusedIterator for Intersection<'_, T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
 }
 
-impl<T, S, A: Allocator> Clone for Difference<'_, T, S, A> {
+impl<T: Clone, S, A: Allocator + Clone> Clone for Difference<'_, T, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         Difference {
@@ -2044,11 +2044,11 @@ impl<T, S, A: Allocator> Clone for Difference<'_, T, S, A> {
     }
 }
 
-impl<'a, T, S, A> Iterator for Difference<'a, T, S, A>
+impl<'a, T: Clone, S, A> Iterator for Difference<'a, T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     type Item = &'a T;
 
@@ -2084,26 +2084,26 @@ where
     }
 }
 
-impl<T, S, A> FusedIterator for Difference<'_, T, S, A>
+impl<T: Clone, S, A> FusedIterator for Difference<'_, T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
 }
 
-impl<T, S, A> fmt::Debug for Difference<'_, T, S, A>
+impl<T: Clone, S, A> fmt::Debug for Difference<'_, T, S, A>
 where
     T: fmt::Debug + Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
 }
 
-impl<T, S, A: Allocator> Clone for SymmetricDifference<'_, T, S, A> {
+impl<T: Clone, S, A: Allocator + Clone> Clone for SymmetricDifference<'_, T, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         SymmetricDifference {
@@ -2112,11 +2112,11 @@ impl<T, S, A: Allocator> Clone for SymmetricDifference<'_, T, S, A> {
     }
 }
 
-impl<'a, T, S, A> Iterator for SymmetricDifference<'a, T, S, A>
+impl<'a, T: Clone, S, A> Iterator for SymmetricDifference<'a, T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     type Item = &'a T;
 
@@ -2140,26 +2140,26 @@ where
     }
 }
 
-impl<T, S, A> FusedIterator for SymmetricDifference<'_, T, S, A>
+impl<T: Clone, S, A> FusedIterator for SymmetricDifference<'_, T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
 }
 
-impl<T, S, A> fmt::Debug for SymmetricDifference<'_, T, S, A>
+impl<T: Clone, S, A> fmt::Debug for SymmetricDifference<'_, T, S, A>
 where
     T: fmt::Debug + Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
 }
 
-impl<T, S, A: Allocator> Clone for Union<'_, T, S, A> {
+impl<T: Clone, S, A: Allocator + Clone> Clone for Union<'_, T, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         Union {
@@ -2168,30 +2168,30 @@ impl<T, S, A: Allocator> Clone for Union<'_, T, S, A> {
     }
 }
 
-impl<T, S, A> FusedIterator for Union<'_, T, S, A>
+impl<T: Clone, S, A> FusedIterator for Union<'_, T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
 }
 
-impl<T, S, A> fmt::Debug for Union<'_, T, S, A>
+impl<T: Clone, S, A> fmt::Debug for Union<'_, T, S, A>
 where
     T: fmt::Debug + Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
 }
 
-impl<'a, T, S, A> Iterator for Union<'a, T, S, A>
+impl<'a, T: Clone, S, A> Iterator for Union<'a, T, S, A>
 where
     T: Eq + Hash,
     S: BuildHasher,
-    A: Allocator,
+    A: Allocator + Clone,
 {
     type Item = &'a T;
 
@@ -2225,7 +2225,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_set::{Entry, HashSet, OccupiedEntry};
+/// use cow_hashbrown::hash_set::{Entry, HashSet, OccupiedEntry};
 ///
 /// let mut set = HashSet::new();
 /// set.extend(["a", "b", "c"]);
@@ -2260,7 +2260,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_set::{Entry, HashSet};
+    /// use cow_hashbrown::hash_set::{Entry, HashSet};
     /// let mut set: HashSet<_> = ["a", "b"].into();
     ///
     /// match set.entry("a") {
@@ -2275,7 +2275,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_set::{Entry, HashSet};
+    /// use cow_hashbrown::hash_set::{Entry, HashSet};
     /// let mut set: HashSet<&str> = HashSet::new();
     ///
     /// match set.entry("a") {
@@ -2303,7 +2303,7 @@ impl<T: fmt::Debug, S, A: Allocator> fmt::Debug for Entry<'_, T, S, A> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_set::{Entry, HashSet, OccupiedEntry};
+/// use cow_hashbrown::hash_set::{Entry, HashSet, OccupiedEntry};
 ///
 /// let mut set = HashSet::new();
 /// set.extend(["a", "b", "c"]);
@@ -2351,7 +2351,7 @@ impl<T: fmt::Debug, S, A: Allocator> fmt::Debug for OccupiedEntry<'_, T, S, A> {
 /// # Examples
 ///
 /// ```
-/// use hashbrown::hash_set::{Entry, HashSet, VacantEntry};
+/// use cow_hashbrown::hash_set::{Entry, HashSet, VacantEntry};
 ///
 /// let mut set = HashSet::<&str>::new();
 ///
@@ -2385,7 +2385,7 @@ impl<'a, T, S, A: Allocator> Entry<'a, T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<&str> = HashSet::new();
     /// let entry = set.entry("horseyland").insert();
@@ -2409,7 +2409,7 @@ impl<'a, T, S, A: Allocator> Entry<'a, T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<&str> = HashSet::new();
     ///
@@ -2438,7 +2438,7 @@ impl<'a, T, S, A: Allocator> Entry<'a, T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<&str> = HashSet::new();
     /// set.entry("poneyland").or_insert();
@@ -2462,7 +2462,7 @@ impl<T, S, A: Allocator> OccupiedEntry<'_, T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_set::{Entry, HashSet};
+    /// use cow_hashbrown::hash_set::{Entry, HashSet};
     ///
     /// let mut set: HashSet<&str> = HashSet::new();
     /// set.entry("poneyland").or_insert();
@@ -2483,8 +2483,8 @@ impl<T, S, A: Allocator> OccupiedEntry<'_, T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
-    /// use hashbrown::hash_set::Entry;
+    /// use cow_hashbrown::HashSet;
+    /// use cow_hashbrown::hash_set::Entry;
     ///
     /// let mut set: HashSet<&str> = HashSet::new();
     /// // The set is empty
@@ -2516,7 +2516,7 @@ impl<T, S, A: Allocator> OccupiedEntry<'_, T, S, A> {
     /// # Examples
     ///
     /// ```
-    ///  use hashbrown::hash_set::{Entry, HashSet};
+    ///  use cow_hashbrown::hash_set::{Entry, HashSet};
     ///  use std::rc::Rc;
     ///
     ///  let mut set: HashSet<Rc<String>> = HashSet::new();
@@ -2550,7 +2550,7 @@ impl<'a, T, S, A: Allocator> VacantEntry<'a, T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
+    /// use cow_hashbrown::HashSet;
     ///
     /// let mut set: HashSet<&str> = HashSet::new();
     /// assert_eq!(set.entry("poneyland").get(), &"poneyland");
@@ -2565,7 +2565,7 @@ impl<'a, T, S, A: Allocator> VacantEntry<'a, T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::hash_set::{Entry, HashSet};
+    /// use cow_hashbrown::hash_set::{Entry, HashSet};
     ///
     /// let mut set: HashSet<&str> = HashSet::new();
     ///
@@ -2584,8 +2584,8 @@ impl<'a, T, S, A: Allocator> VacantEntry<'a, T, S, A> {
     /// # Examples
     ///
     /// ```
-    /// use hashbrown::HashSet;
-    /// use hashbrown::hash_set::Entry;
+    /// use cow_hashbrown::HashSet;
+    /// use cow_hashbrown::hash_set::Entry;
     ///
     /// let mut set: HashSet<&str> = HashSet::new();
     ///
@@ -2603,42 +2603,6 @@ impl<'a, T, S, A: Allocator> VacantEntry<'a, T, S, A> {
         OccupiedEntry {
             inner: self.inner.insert_entry(()),
         }
-    }
-}
-
-#[allow(dead_code)]
-fn assert_covariance() {
-    fn set<'new>(v: HashSet<&'static str>) -> HashSet<&'new str> {
-        v
-    }
-    fn iter<'a, 'new>(v: Iter<'a, &'static str>) -> Iter<'a, &'new str> {
-        v
-    }
-    fn into_iter<'new, A: Allocator>(v: IntoIter<&'static str, A>) -> IntoIter<&'new str, A> {
-        v
-    }
-    fn difference<'a, 'new, A: Allocator>(
-        v: Difference<'a, &'static str, DefaultHashBuilder, A>,
-    ) -> Difference<'a, &'new str, DefaultHashBuilder, A> {
-        v
-    }
-    fn symmetric_difference<'a, 'new, A: Allocator>(
-        v: SymmetricDifference<'a, &'static str, DefaultHashBuilder, A>,
-    ) -> SymmetricDifference<'a, &'new str, DefaultHashBuilder, A> {
-        v
-    }
-    fn intersection<'a, 'new, A: Allocator>(
-        v: Intersection<'a, &'static str, DefaultHashBuilder, A>,
-    ) -> Intersection<'a, &'new str, DefaultHashBuilder, A> {
-        v
-    }
-    fn union<'a, 'new, A: Allocator>(
-        v: Union<'a, &'static str, DefaultHashBuilder, A>,
-    ) -> Union<'a, &'new str, DefaultHashBuilder, A> {
-        v
-    }
-    fn drain<'new, A: Allocator>(d: Drain<'static, &'static str, A>) -> Drain<'new, &'new str, A> {
-        d
     }
 }
 
@@ -2855,7 +2819,7 @@ mod test_set {
 
     #[test]
     fn test_from_map() {
-        let mut a = crate::HashMap::new();
+        let mut a = crate::CowHashMap::new();
         a.insert(1, ());
         a.insert(2, ());
         a.insert(3, ());
@@ -2977,7 +2941,7 @@ mod test_set {
     fn test_replace() {
         use core::hash;
 
-        #[derive(Debug)]
+        #[derive(Debug, Clone)]
         #[allow(dead_code)]
         struct Foo(&'static str, i32);
 

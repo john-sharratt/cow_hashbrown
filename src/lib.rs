@@ -89,8 +89,8 @@ mod map;
 #[cfg(feature = "rustc-internal-api")]
 mod rustc_entry;
 mod scopeguard;
-mod set;
-mod table;
+//mod set;
+//mod table;
 
 pub mod hash_map {
     //! A hash map implemented with quadratic probing and SIMD lookup.
@@ -109,6 +109,7 @@ pub mod hash_map {
         pub use crate::external_trait_impls::rayon::map::*;
     }
 }
+/*
 pub mod hash_set {
     //! A hash set implemented as a `HashMap` where the value is `()`.
     pub use crate::set::*;
@@ -137,11 +138,15 @@ pub mod hash_table {
         pub use crate::external_trait_impls::rayon::table::*;
     }
 }
+*/
 
-pub use crate::map::HashMap;
-pub use crate::set::HashSet;
-pub use crate::table::HashTable;
+use core::ptr;
 
+pub use crate::map::CowHashMap;
+//pub use crate::set::CowHashSet;
+//pub use crate::table::CowHashTable;
+
+use arc_swap::AsRaw;
 #[cfg(feature = "equivalent")]
 pub use equivalent::Equivalent;
 
@@ -193,4 +198,18 @@ pub enum TryReserveError {
         /// The layout of the allocation request that failed.
         layout: alloc::alloc::Layout,
     },
+}
+
+/// Comparison of two pointer-like things.
+// A and B are likely to *be* references, or thin wrappers around that. Calling that with extra
+// reference is just annoying.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn ptr_eq<Base, A, B>(a: A, b: B) -> bool
+where
+    A: AsRaw<Base>,
+    B: AsRaw<Base>,
+{
+    let a = a.as_raw();
+    let b = b.as_raw();
+    ptr::eq(a, b)
 }

@@ -8,8 +8,8 @@ extern crate test;
 
 use test::{black_box, Bencher};
 
-use hashbrown::DefaultHashBuilder;
-use hashbrown::{HashMap, HashSet};
+use cow_hashbrown::DefaultHashBuilder;
+use cow_hashbrown::{CowHashMap, HashSet};
 use std::{
     collections::hash_map::RandomState,
     sync::atomic::{self, AtomicUsize},
@@ -18,9 +18,9 @@ use std::{
 const SIZE: usize = 1000;
 
 // The default hashmap when using this crate directly.
-type AHashMap<K, V> = HashMap<K, V, DefaultHashBuilder>;
+type AHashMap<K, V> = CowHashMap<K, V, DefaultHashBuilder>;
 // This uses the hashmap from this crate with the default hasher of the stdlib.
-type StdHashMap<K, V> = HashMap<K, V, RandomState>;
+type StdHashMap<K, V> = CowHashMap<K, V, RandomState>;
 
 // A random key iterator.
 #[derive(Clone, Copy)]
@@ -254,7 +254,7 @@ bench_suite!(
 
 #[bench]
 fn clone_small(b: &mut Bencher) {
-    let mut m = HashMap::new();
+    let mut m = CowHashMap::new();
     for i in 0..10 {
         m.insert(i, DropType(i));
     }
@@ -266,8 +266,8 @@ fn clone_small(b: &mut Bencher) {
 
 #[bench]
 fn clone_from_small(b: &mut Bencher) {
-    let mut m = HashMap::new();
-    let mut m2 = HashMap::new();
+    let mut m = CowHashMap::new();
+    let mut m2 = CowHashMap::new();
     for i in 0..10 {
         m.insert(i, DropType(i));
     }
@@ -280,7 +280,7 @@ fn clone_from_small(b: &mut Bencher) {
 
 #[bench]
 fn clone_large(b: &mut Bencher) {
-    let mut m = HashMap::new();
+    let mut m = CowHashMap::new();
     for i in 0..1000 {
         m.insert(i, DropType(i));
     }
@@ -292,8 +292,8 @@ fn clone_large(b: &mut Bencher) {
 
 #[bench]
 fn clone_from_large(b: &mut Bencher) {
-    let mut m = HashMap::new();
-    let mut m2 = HashMap::new();
+    let mut m = CowHashMap::new();
+    let mut m2 = CowHashMap::new();
     for i in 0..1000 {
         m.insert(i, DropType(i));
     }

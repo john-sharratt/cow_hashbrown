@@ -4,14 +4,14 @@
 
 extern crate test;
 
-use hashbrown::HashMap;
+use cow_hashbrown::CowHashMap;
 use test::Bencher;
 
 #[bench]
 fn insert(b: &mut Bencher) {
     let keys: Vec<String> = (0..1000).map(|i| format!("xxxx{}yyyy", i)).collect();
     b.iter(|| {
-        let mut m = HashMap::with_capacity(1000);
+        let mut m = CowHashMap::with_capacity(1000);
         for k in &keys {
             m.insert(k, k);
         }
@@ -23,7 +23,7 @@ fn insert(b: &mut Bencher) {
 fn insert_unique_unchecked(b: &mut Bencher) {
     let keys: Vec<String> = (0..1000).map(|i| format!("xxxx{}yyyy", i)).collect();
     b.iter(|| {
-        let mut m = HashMap::with_capacity(1000);
+        let mut m = CowHashMap::with_capacity(1000);
         for k in &keys {
             m.insert_unique_unchecked(k, k);
         }
