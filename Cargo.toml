@@ -1,12 +1,12 @@
 [package]
 name = "cow_hashbrown"
 version = "0.14.5"
-authors = ["Amanieu d'Antras <amanieu@gmail.com>"]
-description = "A Rust port of Google's SwissTable hash map"
+authors = ["Amanieu d'Antras <amanieu@gmail.com>", "John Sharratt <johnathan.sharratt@gmail.com>"]
+description = "A Rust port of Google's SwissTable hash map with copy-on-write support"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rust-lang/hashbrown"
+repository = "https://github.com/john-sharratt/cow_hashbrown"
 readme = "README.md"
-keywords = ["hash", "no_std", "hashmap", "swisstable"]
+keywords = ["hash", "no_std", "hashmap", "swisstable", "cow"]
 categories = ["data-structures", "no-std"]
 exclude = [".github", "/ci/*"]
 edition = "2021"
