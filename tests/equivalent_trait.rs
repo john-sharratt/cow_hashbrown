@@ -31,7 +31,7 @@ where
 #[test]
 fn test_lookup() {
     let s = String::from;
-    let mut map = CowHashMap::new();
+    let map = CowHashMap::new();
     map.insert((s("a"), s("b")), 1);
     map.insert((s("a"), s("x")), 2);
 
@@ -42,7 +42,7 @@ fn test_lookup() {
 #[test]
 fn test_string_str() {
     let s = String::from;
-    let mut map = CowHashMap::new();
+    let map = CowHashMap::new();
     map.insert(s("a"), 1);
     map.insert(s("b"), 2);
     map.insert(s("x"), 3);
