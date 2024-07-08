@@ -3443,7 +3443,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
     where
         K: Equivalent<K>,
     {
-        self.remove_entry().1.load_full()
+        self.remove_entry().1
     }
 
     /// Take the ownership of the key and value from the map.
@@ -3462,7 +3462,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
     /// assert_eq!(map.get(&"a"), None);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove_entry(self) -> (K, Arc<ArcSwap<V>>)
+    pub fn remove_entry(self) -> (K, Arc<V>)
     where
         K: Equivalent<K>,
     {
@@ -3476,7 +3476,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
                 self.elem.as_ref()
             })
             .inner;
-        (ret.0.clone(), ret.1.clone())
+        (ret.0.clone(), ret.1.load_full())
     }
 
     /// Provides shared access to the key and owned access to the value of
@@ -4876,7 +4876,7 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, K, V, S, A>
     /// assert!(map.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove_entry(self) -> (K, Arc<ArcSwap<V>>)
+    pub fn remove_entry(self) -> (K, Arc<V>)
     where
         K: Equivalent<K>,
     {
@@ -4888,7 +4888,7 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, K, V, S, A>
                 if let Some(elem) = elem {
                     t.remove(elem);
                 }
-                (what.0.clone(), what.1.clone())
+                (what.0.clone(), what.1.load_full())
             })
             .inner
     }
@@ -5034,11 +5034,11 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, K, V, S, A>
     /// assert!(map.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn remove(self) -> CowValueGuard<V>
+    pub fn remove(self) -> Arc<V>
     where
         K: Equivalent<K>,
     {
-        CowValueGuard::new(self.remove_entry().1)
+        self.remove_entry().1
     }
 
     /// Replaces the entry, returning the old key and value. The new key in the hash map will be
@@ -7135,7 +7135,7 @@ mod test_map {
         match map.entry(3) {
             Vacant(_) => unreachable!(),
             Occupied(view) => {
-                assert_eq!(view.remove(), 30);
+                assert_eq!(view.remove(), Arc::new(30));
             }
         }
         assert_eq!(map.get(&3), None);
