@@ -2554,7 +2554,7 @@ where
     A: Allocator + Clone,
     V: Clone,
 {
-    type Item = (K, Arc<ArcSwap<V>>);
+    type Item = (K, Arc<V>);
 
     #[cfg_attr(feature = "inline-more", inline)]
     fn next(&mut self) -> Option<Self::Item> {
@@ -2566,7 +2566,7 @@ where
                 v
             });
             ret
-        })
+        }).map(|(k, v)| (k, v.deref().load_full()))
     }
 
     #[inline]
