@@ -10,6 +10,7 @@ use core::borrow::Borrow;
 use core::fmt::{self, Debug};
 use core::hash::{BuildHasher, Hash};
 use core::iter::FusedIterator;
+use core::marker::PhantomData;
 use core::mem;
 use core::ops::{Deref, DerefMut};
 
@@ -184,7 +185,7 @@ use core::ops::{Deref, DerefMut};
 /// ```
 pub struct CowHashMap<K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     pub(crate) hash_builder: S,
-    pub(crate) table: CowRawTable<(K, Arc<ArcSwap<V>>), A>,
+    pub(crate) table: Arc<CowRawTable<(K, Arc<ArcSwap<V>>), A>>,
 }
 
 impl<K: Clone, V, S: Clone, A: Allocator + Clone> Clone for CowHashMap<K, V, S, A> {
@@ -582,7 +583,7 @@ impl<K: Clone, V, S> CowHashMap<K, V, S> {
     pub fn with_hasher(hash_builder: S) -> Self {
         Self {
             hash_builder,
-            table: CowRawTable::new(),
+            table: Arc::new(CowRawTable::new()),
         }
     }
 
@@ -624,7 +625,7 @@ impl<K: Clone, V, S> CowHashMap<K, V, S> {
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
         Self {
             hash_builder,
-            table: CowRawTable::with_capacity(capacity),
+            table: Arc::new(CowRawTable::with_capacity(capacity)),
         }
     }
 }
@@ -667,7 +668,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     pub fn with_hasher_in(hash_builder: S, alloc: A) -> Self {
         Self {
             hash_builder,
-            table: CowRawTable::new_in(alloc),
+            table: Arc::new(CowRawTable::new_in(alloc)),
         }
     }
 
@@ -702,7 +703,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     pub fn with_capacity_and_hasher_in(capacity: usize, hash_builder: S, alloc: A) -> Self {
         Self {
             hash_builder,
-            table: CowRawTable::with_capacity_in(capacity, alloc),
+            table: Arc::new(CowRawTable::with_capacity_in(capacity, alloc)),
         }
     }
 
@@ -1377,7 +1378,10 @@ where
     /// assert_eq!(letters.get(&'y'), None);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn entry(&self, key: K) -> Entry<'_, K, V, S, A> {
+    pub fn entry(&self, key: K) -> Entry<K, V, S, A>
+    where
+        S: Clone,
+    {
         let hash = make_hash::<K, S>(&self.hash_builder, &key);
 
         let table = self.table.inner.load().clone();
@@ -1390,13 +1394,13 @@ where
                     guard: table,
                     inner: elem,
                 },
-                table: self,
+                table: self.clone(),
             })
         } else {
             Entry::Vacant(VacantEntry {
                 hash,
                 key,
-                table: self,
+                table: self.clone(),
             })
         }
     }
@@ -1774,7 +1778,10 @@ where
         &self,
         key: K,
         value: V,
-    ) -> Result<CowValueGuard<V>, OccupiedError<'_, K, V, S, A>> {
+    ) -> Result<CowValueGuard<V>, OccupiedError<K, V, S, A>>
+    where
+        S: Clone,
+    {
         match self.entry(key) {
             Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
             Entry::Vacant(entry) => Ok(entry.insert(value)),
@@ -3691,7 +3698,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> Debug for RawVacantEntryMut<'_, K, V,
 /// vec.sort_unstable();
 /// assert_eq!(vec, [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5), ("f", 6)]);
 /// ```
-pub enum Entry<'a, K: Clone, V, S, A = Global>
+pub enum Entry<K: Clone, V, S, A = Global>
 where
     A: Allocator + Clone,
 {
@@ -3708,7 +3715,7 @@ where
     ///     Entry::Occupied(_) => { }
     /// }
     /// ```
-    Occupied(OccupiedEntry<'a, K, V, S, A>),
+    Occupied(OccupiedEntry<K, V, S, A>),
 
     /// A vacant entry.
     ///
@@ -3723,7 +3730,7 @@ where
     ///     Entry::Vacant(_) => { }
     /// }
     /// ```
-    Vacant(VacantEntry<'a, K, V, S, A>),
+    Vacant(VacantEntry<K, V, S, A>),
 }
 
 /// A view into an occupied entry in a `HashMap`.
@@ -3766,14 +3773,14 @@ where
 /// assert_eq!(map.get(&"c"), None);
 /// assert_eq!(map.len(), 2);
 /// ```
-pub struct OccupiedEntry<'a, K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
+pub struct OccupiedEntry<K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     hash: u64,
     key: Option<K>,
     elem: RawTableGuard<(K, Arc<ArcSwap<V>>), A, Bucket<(K, Arc<ArcSwap<V>>)>>,
-    table: &'a CowHashMap<K, V, S, A>,
+    table: CowHashMap<K, V, S, A>,
 }
 
-unsafe impl<K: Clone, V, S, A> Send for OccupiedEntry<'_, K, V, S, A>
+unsafe impl<K: Clone, V, S, A> Send for OccupiedEntry<K, V, S, A>
 where
     K: Send,
     V: Send,
@@ -3781,7 +3788,7 @@ where
     A: Send + Allocator + Clone,
 {
 }
-unsafe impl<K: Clone, V, S, A> Sync for OccupiedEntry<'_, K, V, S, A>
+unsafe impl<K: Clone, V, S, A> Sync for OccupiedEntry<K, V, S, A>
 where
     K: Sync,
     V: Sync,
@@ -3820,13 +3827,13 @@ where
 /// }
 /// assert!(map[&"b"] == 20 && map.len() == 2);
 /// ```
-pub struct VacantEntry<'a, K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
+pub struct VacantEntry<K: Clone, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     hash: u64,
     key: K,
-    table: &'a CowHashMap<K, V, S, A>,
+    table: CowHashMap<K, V, S, A>,
 }
 
-impl<K: Debug + Clone, V, S, A: Allocator + Clone> Debug for VacantEntry<'_, K, V, S, A> {
+impl<K: Debug + Clone, V, S, A: Allocator + Clone> Debug for VacantEntry<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("VacantEntry").field(self.key()).finish()
     }
@@ -4113,9 +4120,9 @@ where
 /// }
 /// assert_eq!(map[&"a"], 100);
 /// ```
-pub struct OccupiedError<'a, K: Clone, V, S, A: Allocator + Clone = Global> {
+pub struct OccupiedError<K: Clone, V, S, A: Allocator + Clone = Global> {
     /// The entry in the map that was already occupied.
-    pub entry: OccupiedEntry<'a, K, V, S, A>,
+    pub entry: OccupiedEntry<K, V, S, A>,
     /// The value which was not inserted, because the entry was already occupied.
     pub value: V,
 }
@@ -4213,7 +4220,10 @@ impl<K: Clone, V, S, A: Allocator + Clone> IntoIterator for CowHashMap<K, V, S, 
     #[cfg_attr(feature = "inline-more", inline)]
     fn into_iter(self) -> IntoIter<K, V, A> {
         IntoIter {
-            inner: self.table.into_iter(),
+            inner: CowRawIntoIter {
+                iter: unsafe { self.table.iter() },
+                marker: PhantomData,
+            },
         }
     }
 }
@@ -4446,7 +4456,7 @@ where
     }
 }
 
-impl<'a, K: Clone, V, S, A: Allocator + Clone> Entry<'a, K, V, S, A> {
+impl<'a, K: Clone, V, S, A: Allocator + Clone> Entry<K, V, S, A> {
     /// Sets the value of the entry, and returns an OccupiedEntry.
     ///
     /// # Examples
@@ -4460,7 +4470,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> Entry<'a, K, V, S, A> {
     /// assert_eq!(entry.key(), &"horseyland");
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, value: V) -> OccupiedEntry<'a, K, V, S, A>
+    pub fn insert(self, value: V) -> OccupiedEntry<K, V, S, A>
     where
         K: Hash,
         S: BuildHasher,
@@ -4700,7 +4710,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> Entry<'a, K, V, S, A> {
     }
 }
 
-impl<'a, K: Clone, V: Default + Clone, S, A: Allocator + Clone> Entry<'a, K, V, S, A> {
+impl<'a, K: Clone, V: Default + Clone, S, A: Allocator + Clone> Entry<K, V, S, A> {
     /// Ensures a value is in the entry by inserting the default value if empty,
     /// and returns a mutable reference to the value in the entry.
     ///
@@ -4733,7 +4743,7 @@ impl<'a, K: Clone, V: Default + Clone, S, A: Allocator + Clone> Entry<'a, K, V, 
     }
 }
 
-impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, K, V, S, A> {
+impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<K, V, S, A> {
     /// Gets a reference to the key in the entry.
     ///
     /// # Examples
@@ -5085,7 +5095,7 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, K, V, S, A>
     /// assert!(!map.contains_key("poneyland"));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn replace_entry_with<F>(self, f: F) -> Entry<'a, K, V, S, A>
+    pub fn replace_entry_with<F>(self, f: F) -> Entry<K, V, S, A>
     where
         F: Fn(&K, &V) -> Option<V>,
         K: Equivalent<K>,
@@ -5121,7 +5131,7 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<'a, K, V, S, A>
     }
 }
 
-impl<'a, K: Clone, V, S, A: Allocator + Clone> VacantEntry<'a, K, V, S, A> {
+impl<'a, K: Clone, V, S, A: Allocator + Clone> VacantEntry<K, V, S, A> {
     /// Gets a reference to the key that would be used when inserting a value
     /// through the `VacantEntry`.
     ///
@@ -5194,7 +5204,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> VacantEntry<'a, K, V, S, A> {
     }
 
     #[cfg_attr(feature = "inline-more", inline)]
-    pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<'a, K, V, S, A>
+    pub(crate) fn insert_entry(self, value: V) -> OccupiedEntry<K, V, S, A>
     where
         K: Hash,
         S: BuildHasher,

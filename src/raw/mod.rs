@@ -4517,8 +4517,8 @@ where
 
 /// Iterator which consumes a table and returns elements.
 pub struct CowRawIntoIter<T, A: Allocator + Clone = Global> {
-    iter: CowRawIter<T, A>,
-    marker: PhantomData<T>,
+    pub(crate) iter: CowRawIter<T, A>,
+    pub(crate) marker: PhantomData<T>,
 }
 
 impl<T, A: Allocator + Clone> CowRawIntoIter<T, A> {
