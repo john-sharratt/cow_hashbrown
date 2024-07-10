@@ -8,7 +8,7 @@ use core::iter::FusedIterator;
 use core::marker::PhantomData;
 use core::mem;
 use core::mem::MaybeUninit;
-use core::ops::Deref;
+use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 use core::{hint, ptr};
 
@@ -818,6 +818,30 @@ impl<T, A: Allocator + Clone, R> Deref for RawTableGuard<T, A, R> {
     }
 }
 
+pub struct RcuGuard<'a, T, A: Allocator + Clone> {
+    inner: &'a mut RawTable<T, A>,
+    dirty: bool,
+}
+
+impl<T, A: Allocator + Clone> Deref
+for RcuGuard<'_, T, A>
+{
+    type Target = RawTable<T, A>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T, A: Allocator + Clone> DerefMut
+for RcuGuard<'_, T, A>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.dirty = true;
+        &mut self.inner
+    }
+}
+
 impl<T, A: Allocator> CowRawTable<T, A>
 where
     A: Allocator + Clone,
@@ -865,7 +889,7 @@ where
 
     pub fn rcu<F, R>(&self, mut f: F) -> RawTableGuard<T, A, R>
     where
-        F: FnMut(&mut RawTable<T, A>) -> R,
+        F: FnMut(&mut RcuGuard<'_, T, A>) -> R,
         T: Clone,
     {
         let mut cur = self.inner.load();
@@ -874,7 +898,18 @@ where
             let mut new = Arc::new(new);
 
             let new_ptr = Arc::get_mut(&mut new).unwrap();
-            let ret: R = f(new_ptr);
+            let mut guard = RcuGuard {
+                inner: new_ptr,
+                dirty: false,
+            };
+            let ret: R = f(&mut guard);
+
+            if !guard.dirty {
+                return RawTableGuard {
+                    guard: new,
+                    inner: ret,
+                };
+            }
 
             let prev = self.inner.compare_and_swap(&*cur, new.clone());
             let swapped = ptr_eq(&*cur, &*prev);

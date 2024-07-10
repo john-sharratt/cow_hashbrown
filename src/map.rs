@@ -1044,6 +1044,49 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// ```
     pub fn retain<F>(&self, mut f: F)
     where
+        F: FnMut(&K, &V) -> bool,
+        V: Clone,
+    {
+        // Here we only use `iter` as a temporary, preventing use-after-free
+        unsafe {
+            self.table.rcu(|t| {
+                for item in t.iter() {
+                    let &(ref key, ref value) = item.as_ref();
+                    let value = value.load();
+                    let retain = f(key, &value);
+                    if !retain {
+                        t.erase(item);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Retains only the elements specified by the predicate. Keeps the
+    /// allocated memory for reuse.
+    ///
+    /// In other words, remove all pairs `(k, v)` such that `f(&k, &mut v)` returns `false`.
+    /// The elements are visited in unsorted (and unspecified) order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<i32, i32> = (0..8).map(|x|(x, x*10)).collect();
+    /// assert_eq!(map.len(), 8);
+    ///
+    /// map.retain(|&k, _| k % 2 == 0);
+    ///
+    /// // We can see, that the number of elements inside map is changed.
+    /// assert_eq!(map.len(), 4);
+    ///
+    /// let mut vec: Vec<(i32, i32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
+    /// vec.sort_unstable();
+    /// assert_eq!(vec, [(0, 0), (2, 20), (4, 40), (6, 60)]);
+    /// ```
+    pub fn retain_mut<F>(&self, mut f: F)
+    where
         F: FnMut(&K, &mut V) -> bool,
         V: Clone,
     {
