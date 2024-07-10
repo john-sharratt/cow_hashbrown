@@ -10,7 +10,6 @@ use core::borrow::Borrow;
 use core::fmt::{self, Debug};
 use core::hash::{BuildHasher, Hash};
 use core::iter::FusedIterator;
-use core::marker::PhantomData;
 use core::mem;
 use core::ops::{Deref, DerefMut};
 
@@ -148,7 +147,7 @@ use core::ops::{Deref, DerefMut};
 /// ```
 /// use cow_hashbrown::CowHashMap as HashMap;
 ///
-/// #[derive(Hash, Eq, PartialEq, Debug)]
+/// #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 /// struct Viking {
 ///     name: String,
 ///     country: String,
@@ -772,7 +771,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn keys(&self) -> Keys<'_, K, V, A> {
+    pub fn keys(&self) -> Keys<K, V, A> {
         Keys { inner: self.iter() }
     }
 
@@ -804,7 +803,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn values(&self) -> Values<'_, K, V, A> {
+    pub fn values(&self) -> Values<K, V, A> {
         Values { inner: self.iter() }
     }
 
@@ -842,7 +841,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn values_mut(&self) -> ValuesMut<'_, K, V, A> {
+    pub fn values_mut(&self) -> ValuesMut<K, V, A> {
         ValuesMut {
             inner: self.iter_mut(),
         }
@@ -876,12 +875,11 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn iter(&self) -> Iter<'_, K, V, A> {
+    pub fn iter(&self) -> Iter<K, V, A> {
         // Here we tie the lifetime of self to the iter.
         unsafe {
             Iter {
                 inner: self.table.iter(),
-                marker: PhantomData,
             }
         }
     }
@@ -921,12 +919,11 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// assert_eq!(map.len(), 3);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn iter_mut(&self) -> IterMut<'_, K, V, A> {
+    pub fn iter_mut(&self) -> IterMut<K, V, A> {
         // Here we tie the lifetime of self to the iter.
         unsafe {
             IterMut {
                 inner: self.table.iter(),
-                marker: PhantomData,
             }
         }
     }
@@ -982,6 +979,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     ///
     /// ```
     /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use std::sync::Arc;
     ///
     /// let mut a = HashMap::new();
     /// a.insert(1, "a");
@@ -990,7 +988,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     ///
     /// for (k, v) in a.drain().take(1) {
     ///     assert!(k == 1 || k == 2);
-    ///     assert!(v == "a" || v == "b");
+    ///     assert!(v == Arc::new("a") || v == Arc::new("b"));
     /// }
     ///
     /// // As we can see, the map is empty and contains no element.
@@ -1010,7 +1008,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> CowHashMap<K, V, S, A> {
     /// assert!(a.is_empty());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn drain(&self) -> Iter<'_, K, V, A> {
+    pub fn drain(&self) -> Iter<K, V, A> {
         self.table
             .rcu(|t| {
                 let ret = self.iter();
@@ -1364,6 +1362,7 @@ where
     ///
     /// ```
     /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use std::sync::Arc;
     ///
     /// let mut letters = HashMap::new();
     ///
@@ -1372,9 +1371,9 @@ where
     ///     *counter += 1;
     /// }
     ///
-    /// assert_eq!(letters[&'s'], 2);
-    /// assert_eq!(letters[&'t'], 3);
-    /// assert_eq!(letters[&'u'], 1);
+    /// assert_eq!(letters.get(&'s').unwrap(), Arc::new(2));
+    /// assert_eq!(letters.get(&'t').unwrap(), Arc::new(3));
+    /// assert_eq!(letters.get(&'u').unwrap(), Arc::new(1));
     /// assert_eq!(letters.get(&'y'), None);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
@@ -1408,6 +1407,7 @@ where
     ///
     /// ```
     /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use std::sync::Arc;
     ///
     /// let mut words: HashMap<String, usize> = HashMap::new();
     /// let source = ["poneyland", "horseyland", "poneyland", "poneyland"];
@@ -1416,8 +1416,8 @@ where
     ///     *counter += 1;
     /// }
     ///
-    /// assert_eq!(words["poneyland"], 3);
-    /// assert_eq!(words["horseyland"], 1);
+    /// assert_eq!(words.get("poneyland").unwrap(), Arc::new(3));
+    /// assert_eq!(words.get("horseyland").unwrap(), Arc::new(1));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn entry_ref<'a, 'b, 'c, Q>(&'a self, key: &'b Q) -> EntryRef<'a, 'b, K, Q, V, S, A>
@@ -2122,14 +2122,12 @@ where
 /// assert_eq!(iter.next(), None);
 /// assert_eq!(iter.next(), None);
 /// ```
-pub struct Iter<'a, K, V, A: Allocator + Clone = Global>
-{
+pub struct Iter<K, V, A: Allocator + Clone = Global> {
     inner: CowRawIter<(K, Arc<ArcSwap<V>>), A>,
-    marker: PhantomData<(&'a K, &'a Arc<ArcSwap<V>>)>,
 }
 
 // FIXME(#26925) Remove in favor of `#[derive(Clone)]`
-impl<K, V, A> Clone for Iter<'_, K, V, A>
+impl<K, V, A> Clone for Iter<K, V, A>
 where
     A: Allocator + Clone,
 {
@@ -2137,7 +2135,6 @@ where
     fn clone(&self) -> Self {
         Iter {
             inner: self.inner.clone(),
-            marker: PhantomData,
         }
     }
 }
@@ -2169,28 +2166,24 @@ where
 /// assert_eq!(map.get(&1).unwrap(), &Arc::new("One Mississippi".to_owned()));
 /// assert_eq!(map.get(&2).unwrap(), &Arc::new("Two Mississippi".to_owned()));
 /// ```
-pub struct IterMut<'a, K, V, A: Allocator + Clone = Global>
-{
+pub struct IterMut<K, V, A: Allocator + Clone = Global> {
     inner: CowRawIter<(K, Arc<ArcSwap<V>>), A>,
-    // To ensure invariance with respect to V
-    marker: PhantomData<(&'a K, &'a mut V)>,
 }
 
 // We override the default Send impl which has K: Sync instead of K: Send. Both
 // are correct, but this one is more general since it allows keys which
 // implement Send but not Sync.
-unsafe impl<K: Send, V: Send, A> Send for IterMut<'_, K, V, A> where A: Allocator + Clone {}
+unsafe impl<K: Send, V: Send, A> Send for IterMut<K, V, A> where A: Allocator + Clone {}
 
-impl<K, V, A> IterMut<'_, K, V, A>
+impl<K, V, A> IterMut<K, V, A>
 where
     A: Allocator + Clone,
 {
     /// Returns a iterator of references over the remaining items.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn iter(&self) -> Iter<'_, K, V, A> {
+    pub fn iter(&self) -> Iter<K, V, A> {
         Iter {
             inner: self.inner.clone(),
-            marker: PhantomData,
         }
     }
 }
@@ -2232,10 +2225,9 @@ pub struct IntoIter<K, V, A: Allocator + Clone = Global> {
 impl<K, V, A: Allocator + Clone> IntoIter<K, V, A> {
     /// Returns a iterator of references over the remaining items.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn iter(&self) -> Iter<'_, K, V, A> {
+    pub fn iter(&self) -> Iter<K, V, A> {
         Iter {
             inner: self.inner.iter(),
-            marker: PhantomData,
         }
     }
 }
@@ -2393,12 +2385,12 @@ impl<K: Clone, V, A: Allocator + Clone> FusedIterator for IntoValues<K, V, A> {}
 /// assert_eq!(keys.next(), None);
 /// assert_eq!(keys.next(), None);
 /// ```
-pub struct Keys<'a, K: Clone, V, A: Allocator + Clone = Global> {
-    inner: Iter<'a, K, V, A>,
+pub struct Keys<K: Clone, V, A: Allocator + Clone = Global> {
+    inner: Iter<K, V, A>,
 }
 
 // FIXME(#26925) Remove in favor of `#[derive(Clone)]`
-impl<K: Clone, V, A: Allocator + Clone> Clone for Keys<'_, K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> Clone for Keys<K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         Keys {
@@ -2407,7 +2399,7 @@ impl<K: Clone, V, A: Allocator + Clone> Clone for Keys<'_, K, V, A> {
     }
 }
 
-impl<K: Debug + Clone, V, A: Allocator + Clone> fmt::Debug for Keys<'_, K, V, A> {
+impl<K: Debug + Clone, V, A: Allocator + Clone> fmt::Debug for Keys<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -2442,12 +2434,12 @@ impl<K: Debug + Clone, V, A: Allocator + Clone> fmt::Debug for Keys<'_, K, V, A>
 /// assert_eq!(values.next(), None);
 /// assert_eq!(values.next(), None);
 /// ```
-pub struct Values<'a, K: Clone, V, A: Allocator + Clone = Global> {
-    inner: Iter<'a, K, V, A>,
+pub struct Values<K: Clone, V, A: Allocator + Clone = Global> {
+    inner: Iter<K, V, A>,
 }
 
 // FIXME(#26925) Remove in favor of `#[derive(Clone)]`
-impl<K: Clone, V, A: Allocator + Clone> Clone for Values<'_, K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> Clone for Values<K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn clone(&self) -> Self {
         Values {
@@ -2456,7 +2448,7 @@ impl<K: Clone, V, A: Allocator + Clone> Clone for Values<'_, K, V, A> {
     }
 }
 
-impl<K: Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for Values<'_, K, V, A> {
+impl<K: Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for Values<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
     }
@@ -2497,13 +2489,12 @@ pub struct Drain<'a, K: Clone, V, A: Allocator + Clone = Global> {
 impl<K: Clone, V, A: Allocator + Clone> Drain<'_, K, V, A> {
     /// Returns a iterator of references over the remaining items.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn iter(&self) -> Iter<'_, K, V, A> {
+    pub fn iter(&self) -> Iter<K, V, A> {
         Iter {
             inner: CowRawIter {
                 inner: self.inner.iter(),
                 guard: Guard::from_inner(self.inner.guard.clone()),
             },
-            marker: PhantomData,
         }
     }
 }
@@ -2558,15 +2549,17 @@ where
 
     #[cfg_attr(feature = "inline-more", inline)]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next(|&mut (ref k, ref mut v)| {
-            let mut ret = false;
-            v.rcu(|v| {
-                let mut v = v.deref().clone();
-                ret = (self.f)(k, &mut v);
-                v
-            });
-            ret
-        }).map(|(k, v)| (k, v.deref().load_full()))
+        self.inner
+            .next(|&mut (ref k, ref mut v)| {
+                let mut ret = false;
+                v.rcu(|v| {
+                    let mut v = v.deref().clone();
+                    ret = (self.f)(k, &mut v);
+                    v
+                });
+                ret
+            })
+            .map(|(k, v)| (k, v.deref().load_full()))
     }
 
     #[inline]
@@ -2608,8 +2601,8 @@ impl<K: Clone, V: Clone, F, A: Allocator + Clone> FusedIterator for ExtractIf<'_
 /// assert_eq!(map.get(&1).unwrap(), Arc::new("One Mississippi".to_owned()));
 /// assert_eq!(map.get(&2).unwrap(), Arc::new("Two Mississippi".to_owned()));
 /// ```
-pub struct ValuesMut<'a, K: Clone, V, A: Allocator + Clone = Global> {
-    inner: IterMut<'a, K, V, A>,
+pub struct ValuesMut<K: Clone, V, A: Allocator + Clone = Global> {
+    inner: IterMut<K, V, A>,
 }
 
 /// A builder for computing where in a [`HashMap`] a key-value pair would be stored.
@@ -3324,7 +3317,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
     pub fn insert(&self, value: V) -> Arc<V> {
         let new_value = Arc::new(value);
         let elem = unsafe { &self.elem.as_ref().1 };
-        
+
         let mut ret = elem.load_full();
         elem.rcu(|v| {
             ret = v.clone();
@@ -4127,9 +4120,9 @@ pub struct OccupiedError<'a, K: Clone, V, S, A: Allocator + Clone = Global> {
     pub value: V,
 }
 
-impl<'a, K: Clone, V, S, A: Allocator + Clone> IntoIterator for &'a CowHashMap<K, V, S, A> {
+impl<K: Clone, V, S, A: Allocator + Clone> IntoIterator for &CowHashMap<K, V, S, A> {
     type Item = (K, Arc<V>);
-    type IntoIter = Iter<'a, K, V, A>;
+    type IntoIter = Iter<K, V, A>;
 
     /// Creates an iterator over the entries of a `HashMap` in arbitrary order.
     /// The iterator element type is `(&'a K, &'a V)`.
@@ -4148,18 +4141,18 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> IntoIterator for &'a CowHashMap<K
     ///
     /// for (key, value) in &map_one {
     ///     println!("Key: {}", key);
-    ///     map_two.insert_unique_unchecked(*key, *value);
+    ///     map_two.insert_unique_unchecked(key, *value);
     /// }
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    fn into_iter(self) -> Iter<'a, K, V, A> {
+    fn into_iter(self) -> Iter<K, V, A> {
         self.iter()
     }
 }
 
-impl<'a, K: Clone, V, S, A: Allocator + Clone> IntoIterator for &'a mut CowHashMap<K, V, S, A> {
+impl<K: Clone, V, S, A: Allocator + Clone> IntoIterator for &mut CowHashMap<K, V, S, A> {
     type Item = (K, CowValueGuard<V>);
-    type IntoIter = IterMut<'a, K, V, A>;
+    type IntoIter = IterMut<K, V, A>;
 
     /// Creates an iterator over the entries of a `HashMap` in arbitrary order
     /// with mutable references to the values. The iterator element type is
@@ -4187,10 +4180,10 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> IntoIterator for &'a mut CowHashM
     /// // The `Iter` iterator produces items in arbitrary order, so the
     /// // items must be sorted to test them against a sorted array.
     /// vec.sort_unstable();
-    /// assert_eq!(vec, [(&"a", Arc::new(2)), (&"b", Arc::new(4)), (&"c", Arc::new(6))]);
+    /// assert_eq!(vec, [(&"a", Arc::new(2)), (&"b", Arc::new(4)), ("c", Arc::new(6))]);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    fn into_iter(self) -> IterMut<'a, K, V, A> {
+    fn into_iter(self) -> IterMut<K, V, A> {
         self.iter_mut()
     }
 }
@@ -4225,7 +4218,7 @@ impl<K: Clone, V, S, A: Allocator + Clone> IntoIterator for CowHashMap<K, V, S, 
     }
 }
 
-impl<'a, K: Clone, V, A> Iterator for Iter<'a, K, V, A>
+impl<K: Clone, V, A> Iterator for Iter<K, V, A>
 where
     A: Allocator + Clone,
 {
@@ -4247,7 +4240,7 @@ where
         self.inner.size_hint()
     }
 }
-impl<K: Clone, V, A> ExactSizeIterator for Iter<'_, K, V, A>
+impl<K: Clone, V, A> ExactSizeIterator for Iter<K, V, A>
 where
     A: Allocator + Clone,
 {
@@ -4257,9 +4250,9 @@ where
     }
 }
 
-impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Iter<'_, K, V, A> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Iter<K, V, A> {}
 
-impl<'a, K: Clone, V, A> Iterator for IterMut<'a, K, V, A>
+impl<'a, K: Clone, V, A> Iterator for IterMut<K, V, A>
 where
     A: Allocator + Clone,
 {
@@ -4281,7 +4274,7 @@ where
         self.inner.size_hint()
     }
 }
-impl<K: Clone, V, A> ExactSizeIterator for IterMut<'_, K, V, A>
+impl<K: Clone, V, A> ExactSizeIterator for IterMut<K, V, A>
 where
     A: Allocator + Clone,
 {
@@ -4290,9 +4283,9 @@ where
         self.inner.len()
     }
 }
-impl<K: Clone, V, A> FusedIterator for IterMut<'_, K, V, A> where A: Allocator + Clone {}
+impl<K: Clone, V, A> FusedIterator for IterMut<K, V, A> where A: Allocator + Clone {}
 
-impl<K, V, A> fmt::Debug for IterMut<'_, K, V, A>
+impl<K, V, A> fmt::Debug for IterMut<K, V, A>
 where
     K: fmt::Debug + Clone,
     V: fmt::Debug + Clone,
@@ -4335,7 +4328,7 @@ impl<K: Debug + Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for In
     }
 }
 
-impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Keys<'a, K, V, A> {
+impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Keys<K, V, A> {
     type Item = K;
 
     #[cfg_attr(feature = "inline-more", inline)]
@@ -4359,15 +4352,15 @@ impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Keys<'a, K, V, A> {
         self.inner.fold(init, |acc, (k, _)| f(acc, k))
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Keys<'_, K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Keys<K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Keys<'_, K, V, A> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Keys<K, V, A> {}
 
-impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Values<'a, K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> Iterator for Values<K, V, A> {
     type Item = Arc<V>;
 
     #[cfg_attr(feature = "inline-more", inline)]
@@ -4382,15 +4375,15 @@ impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Values<'a, K, V, A> {
         self.inner.size_hint()
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Values<'_, K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Values<K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Values<'_, K, V, A> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Values<K, V, A> {}
 
-impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for ValuesMut<'a, K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> Iterator for ValuesMut<K, V, A> {
     type Item = CowValueGuard<V>;
 
     #[cfg_attr(feature = "inline-more", inline)]
@@ -4406,15 +4399,15 @@ impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for ValuesMut<'a, K, V, A> 
         self.inner.size_hint()
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for ValuesMut<'_, K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for ValuesMut<K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> FusedIterator for ValuesMut<'_, K, V, A> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for ValuesMut<K, V, A> {}
 
-impl<K: Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for ValuesMut<'_, K, V, A> {
+impl<K: Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for ValuesMut<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list()
             .entries(self.inner.iter().map(|(_, val)| val))
@@ -4434,15 +4427,15 @@ impl<'a, K: Clone, V, A: Allocator + Clone> Iterator for Drain<'a, K, V, A> {
         self.inner.size_hint()
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Drain<'_, K, V, A> {
+impl<'a, K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Drain<'a, K, V, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Drain<'_, K, V, A> {}
+impl<'a, K: Clone, V, A: Allocator + Clone> FusedIterator for Drain<'a, K, V, A> {}
 
-impl<K: Clone, V, A> fmt::Debug for Drain<'_, K, V, A>
+impl<'a, K: Clone, V, A> fmt::Debug for Drain<'a, K, V, A>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -6017,8 +6010,7 @@ where
     #[cfg_attr(feature = "inline-more", inline)]
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         let iter = iter.into_iter();
-        let map =
-            Self::with_capacity_and_hasher_in(iter.size_hint().0, S::default(), A::default());
+        let map = Self::with_capacity_and_hasher_in(iter.size_hint().0, S::default(), A::default());
         iter.for_each(|(k, v)| {
             map.insert(k, v);
         });
@@ -6040,7 +6032,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use cow_hashbrown::hash_map::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, 100);
@@ -6127,7 +6119,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use cow_hashbrown::hash_map::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, 100);
@@ -6192,7 +6184,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use cow_hashbrown::hash_map::HashMap;
+    /// use cow_hashbrown::CowHashMap as HashMap;
     ///
     /// let mut map = HashMap::new();
     /// map.insert(1, 100);
