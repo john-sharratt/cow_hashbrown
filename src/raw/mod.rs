@@ -819,13 +819,11 @@ impl<T, A: Allocator + Clone, R> Deref for RawTableGuard<T, A, R> {
 }
 
 pub struct RcuGuard<'a, T, A: Allocator + Clone> {
-    inner: &'a mut RawTable<T, A>,
+    pub(crate) inner: &'a mut RawTable<T, A>,
     dirty: bool,
 }
 
-impl<T, A: Allocator + Clone> Deref
-for RcuGuard<'_, T, A>
-{
+impl<T, A: Allocator + Clone> Deref for RcuGuard<'_, T, A> {
     type Target = RawTable<T, A>;
 
     fn deref(&self) -> &Self::Target {
@@ -833,9 +831,7 @@ for RcuGuard<'_, T, A>
     }
 }
 
-impl<T, A: Allocator + Clone> DerefMut
-for RcuGuard<'_, T, A>
-{
+impl<T, A: Allocator + Clone> DerefMut for RcuGuard<'_, T, A> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.dirty = true;
         &mut self.inner
@@ -885,6 +881,24 @@ where
     {
         let guard = self.inner.load();
         f(&guard)
+    }
+
+    pub fn rcu_fast<F, R>(self: &mut Arc<Self>, mut f: F) -> R
+    where
+        F: FnMut(&mut RcuGuard<'_, T, A>) -> R,
+        T: Clone,
+    {
+        if let Some(this) = Arc::get_mut(self) {
+            if let Some(val) = this.inner.try_mut() {
+                let mut guard = RcuGuard {
+                    inner: val,
+                    dirty: false,
+                };
+                return f(&mut guard);
+            }
+        }
+
+        self.rcu(f).inner
     }
 
     pub fn rcu<F, R>(&self, mut f: F) -> RawTableGuard<T, A, R>

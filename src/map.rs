@@ -265,12 +265,12 @@ enum CowValueGuardMode<T> {
 }
 
 /// A guard for a value in a `CowHashMap`.
-pub struct CowValueGuard<V> {
+pub struct CowValueGuard<V: Clone> {
     inner: Arc<ArcSwap<V>>,
     mode: CowValueGuardMode<V>,
 }
 
-impl<V> CowValueGuard<V> {
+impl<V: Clone> CowValueGuard<V> {
     /// Creates a new `CowValueGuard`.
     pub fn new(inner: Arc<ArcSwap<V>>) -> Self {
         Self {
@@ -280,7 +280,7 @@ impl<V> CowValueGuard<V> {
     }
 }
 
-impl<V> PartialEq<V> for CowValueGuard<V>
+impl<V: Clone> PartialEq<V> for CowValueGuard<V>
 where
     V: PartialEq<V>,
 {
@@ -304,7 +304,7 @@ where
     }
 }
 
-impl<V> PartialEq for CowValueGuard<V>
+impl<V: Clone> PartialEq for CowValueGuard<V>
 where
     V: PartialEq<V>,
 {
@@ -328,7 +328,7 @@ where
     }
 }
 
-impl<V> Debug for CowValueGuard<V>
+impl<V: Clone> Debug for CowValueGuard<V>
 where
     V: Debug,
 {
@@ -340,9 +340,9 @@ where
     }
 }
 
-impl<V> Eq for CowValueGuard<V> where V: Eq {}
+impl<V: Clone> Eq for CowValueGuard<V> where V: Eq {}
 
-impl<V> Deref for CowValueGuard<V> {
+impl<V: Clone> Deref for CowValueGuard<V> {
     type Target = V;
 
     fn deref(&self) -> &V {
@@ -353,10 +353,7 @@ impl<V> Deref for CowValueGuard<V> {
     }
 }
 
-impl<V> DerefMut for CowValueGuard<V>
-where
-    V: Clone,
-{
+impl<V: Clone> DerefMut for CowValueGuard<V> {
     fn deref_mut(&mut self) -> &mut V {
         match &mut self.mode {
             CowValueGuardMode::Read(inner) => {
@@ -372,7 +369,7 @@ where
     }
 }
 
-impl<V> Drop for CowValueGuard<V> {
+impl<V: Clone> Drop for CowValueGuard<V> {
     fn drop(&mut self) {
         match &mut self.mode {
             CowValueGuardMode::Read(_) => {}
@@ -1590,6 +1587,7 @@ where
     pub fn get_key_value_mut<Q>(&self, k: &Q) -> Option<(K, CowValueGuard<V>)>
     where
         Q: Hash + Equivalent<K> + ?Sized,
+        V: Clone,
     {
         self.table.map(|t| {
             if t.is_empty() {
@@ -1663,6 +1661,7 @@ where
     pub fn get_mut<Q>(&self, k: &Q) -> Option<CowValueGuard<V>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
+        V: Clone,
     {
         self.table.map(|t| {
             if t.is_empty() {
@@ -1702,7 +1701,7 @@ where
     /// assert_eq!(map[&37], "c");
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(&self, k: K, v: V) -> Option<CowValueGuard<V>> {
+    pub fn insert(&self, k: K, v: V) -> Option<Arc<V>> {
         let hash = make_hash::<K, S>(&self.hash_builder, &k);
         let v = Arc::new(ArcSwap::new(Arc::new(v)));
         let ret = self
@@ -1721,6 +1720,154 @@ where
                 }
             })
             .inner;
+        ret.map(|r| r.load_full())
+    }
+
+    /// Inserts a key-value pair into the map.
+    ///
+    /// If the map did not have this key present, [`None`] is returned.
+    ///
+    /// If the map did have this key present, the value is updated, and the old
+    /// value is returned. The key is not updated, though; this matters for
+    /// types that can be `==` without being identical. See the [`std::collections`]
+    /// [module-level documentation] for more.
+    ///
+    /// [`None`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.None
+    /// [`std::collections`]: https://doc.rust-lang.org/std/collections/index.html
+    /// [module-level documentation]: https://doc.rust-lang.org/std/collections/index.html#insert-and-complex-keys
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// assert_eq!(map.insert(37, "a"), None);
+    /// assert_eq!(map.is_empty(), false);
+    ///
+    /// map.insert(37, "b");
+    /// assert_eq!(map.insert(37, "c"), Some("b"));
+    /// assert_eq!(map[&37], "c");
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn insert_fast(&mut self, k: K, v: V) -> Option<Arc<V>> {
+        let hash = make_hash::<K, S>(&self.hash_builder, &k);
+        let v = Arc::new(ArcSwap::new(Arc::new(v)));
+
+        let ret = self.table.rcu_fast(|t| {
+            let v = v.clone();
+            let hasher = make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder);
+            match t.find_or_find_insert_slot(hash, equivalent_key(&k), hasher) {
+                Ok(bucket) => Some(mem::replace(unsafe { &mut bucket.as_mut().1 }, v)),
+                Err(slot) => {
+                    unsafe {
+                        t.insert_in_slot(hash, slot, (k.clone(), v));
+                    }
+                    None
+                }
+            }
+        })?;
+        Some(ret.load_full())
+    }
+
+    /// Inserts a key-value pair into the map.
+    ///
+    /// If the map did not have this key present, [`None`] is returned.
+    ///
+    /// If the map did have this key present, the value is updated, and the old
+    /// value is returned. The key is not updated, though; this matters for
+    /// types that can be `==` without being identical. See the [`std::collections`]
+    /// [module-level documentation] for more.
+    ///
+    /// [`None`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.None
+    /// [`std::collections`]: https://doc.rust-lang.org/std/collections/index.html
+    /// [module-level documentation]: https://doc.rust-lang.org/std/collections/index.html#insert-and-complex-keys
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// assert_eq!(map.insert(37, "a"), None);
+    /// assert_eq!(map.is_empty(), false);
+    ///
+    /// map.insert(37, "b");
+    /// assert_eq!(map.insert(37, "c"), Some("b"));
+    /// assert_eq!(map[&37], "c");
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn insert_mut(&self, k: K, v: V) -> Option<CowValueGuard<V>>
+    where
+        V: Clone,
+    {
+        let hash = make_hash::<K, S>(&self.hash_builder, &k);
+        let v = Arc::new(ArcSwap::new(Arc::new(v)));
+        let ret = self
+            .table
+            .rcu(|t| {
+                let v = v.clone();
+                let hasher = make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder);
+                match t.find_or_find_insert_slot(hash, equivalent_key(&k), hasher) {
+                    Ok(bucket) => Some(mem::replace(unsafe { &mut bucket.as_mut().1 }, v)),
+                    Err(slot) => {
+                        unsafe {
+                            t.insert_in_slot(hash, slot, (k.clone(), v));
+                        }
+                        None
+                    }
+                }
+            })
+            .inner;
+        ret.map(|r| CowValueGuard::new(r))
+    }
+
+    /// Inserts a key-value pair into the map.
+    ///
+    /// If the map did not have this key present, [`None`] is returned.
+    ///
+    /// If the map did have this key present, the value is updated, and the old
+    /// value is returned. The key is not updated, though; this matters for
+    /// types that can be `==` without being identical. See the [`std::collections`]
+    /// [module-level documentation] for more.
+    ///
+    /// [`None`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.None
+    /// [`std::collections`]: https://doc.rust-lang.org/std/collections/index.html
+    /// [module-level documentation]: https://doc.rust-lang.org/std/collections/index.html#insert-and-complex-keys
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// assert_eq!(map.insert(37, "a"), None);
+    /// assert_eq!(map.is_empty(), false);
+    ///
+    /// map.insert(37, "b");
+    /// assert_eq!(map.insert(37, "c"), Some("b"));
+    /// assert_eq!(map[&37], "c");
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn insert_mut_fast(&mut self, k: K, v: V) -> Option<CowValueGuard<V>>
+    where
+        V: Clone,
+    {
+        let hash = make_hash::<K, S>(&self.hash_builder, &k);
+        let v = Arc::new(ArcSwap::new(Arc::new(v)));
+        let ret = self.table.rcu_fast(|t| {
+            let v = v.clone();
+            let hasher = make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder);
+            match t.find_or_find_insert_slot(hash, equivalent_key(&k), hasher) {
+                Ok(bucket) => Some(mem::replace(unsafe { &mut bucket.as_mut().1 }, v)),
+                Err(slot) => {
+                    unsafe {
+                        t.insert_in_slot(hash, slot, (k.clone(), v));
+                    }
+                    None
+                }
+            }
+        });
         ret.map(|r| CowValueGuard::new(r))
     }
 
@@ -1774,7 +1921,74 @@ where
     /// assert_eq!(map2.len(), 4);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert_unique_unchecked(&self, k: K, v: V) -> (&K, CowValueGuard<V>) {
+    pub fn insert_unique_unchecked(&self, k: K, v: V) -> (&K, Arc<V>) {
+        let hash = make_hash::<K, S>(&self.hash_builder, &k);
+        let v = Arc::new(ArcSwap::new(Arc::new(v)));
+        let bucket = self.table.rcu(|t| {
+            t.insert(
+                hash,
+                (k.clone(), v.clone()),
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.hash_builder),
+            )
+        });
+        let (k_ref, v_ref) = unsafe { bucket.as_ref() };
+        (k_ref, v_ref.load_full())
+    }
+
+    /// Insert a key-value pair into the map without checking
+    /// if the key already exists in the map.
+    ///
+    /// Returns a reference to the key and value just inserted.
+    ///
+    /// This operation is safe if a key does not exist in the map.
+    ///
+    /// However, if a key exists in the map already, the behavior is unspecified:
+    /// this operation may panic, loop forever, or any following operation with the map
+    /// may panic, loop forever or return arbitrary result.
+    ///
+    /// That said, this operation (and following operations) are guaranteed to
+    /// not violate memory safety.
+    ///
+    /// This operation is faster than regular insert, because it does not perform
+    /// lookup before insertion.
+    ///
+    /// This operation is useful during initial population of the map.
+    /// For example, when constructing a map from another map, we know
+    /// that keys are unique.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map1 = HashMap::new();
+    /// assert_eq!(map1.insert(1, "a"), None);
+    /// assert_eq!(map1.insert(2, "b"), None);
+    /// assert_eq!(map1.insert(3, "c"), None);
+    /// assert_eq!(map1.len(), 3);
+    ///
+    /// let mut map2 = HashMap::new();
+    ///
+    /// for (key, value) in map1.into_iter() {
+    ///     map2.insert_unique_unchecked(key, value);
+    /// }
+    ///
+    /// let (key, value) = map2.insert_unique_unchecked(4, "d");
+    /// assert_eq!(key, &4);
+    /// assert_eq!(value, &mut "d");
+    /// *value = "e";
+    ///
+    /// assert_eq!(map2[&1], "a");
+    /// assert_eq!(map2[&2], "b");
+    /// assert_eq!(map2[&3], "c");
+    /// assert_eq!(map2[&4], "e");
+    /// assert_eq!(map2.len(), 4);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn insert_unique_unchecked_mut(&self, k: K, v: V) -> (&K, CowValueGuard<V>)
+    where
+        V: Clone,
+    {
         let hash = make_hash::<K, S>(&self.hash_builder, &k);
         let v = Arc::new(ArcSwap::new(Arc::new(v)));
         let bucket = self.table.rcu(|t| {
@@ -1817,17 +2031,57 @@ where
     /// }
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn try_insert(
-        &self,
-        key: K,
-        value: V,
-    ) -> Result<CowValueGuard<V>, OccupiedError<K, V, S, A>>
+    pub fn try_insert(&self, key: K, value: V) -> Result<Arc<V>, OccupiedError<K, V, S, A>>
     where
         S: Clone,
     {
         match self.entry(key) {
             Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
             Entry::Vacant(entry) => Ok(entry.insert(value)),
+        }
+    }
+
+    /// Tries to insert a key-value pair into the map, and returns
+    /// a mutable reference to the value in the entry.
+    ///
+    /// # Errors
+    ///
+    /// If the map already had this key present, nothing is updated, and
+    /// an error containing the occupied entry and the value is returned.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::OccupiedError;
+    ///
+    /// let mut map = HashMap::new();
+    /// assert_eq!(map.try_insert(37, "a").unwrap(), &"a");
+    ///
+    /// match map.try_insert(37, "b") {
+    ///     Err(OccupiedError { entry, value }) => {
+    ///         assert_eq!(entry.key(), &37);
+    ///         assert_eq!(entry.get(), &"a");
+    ///         assert_eq!(value, "b");
+    ///     }
+    ///     _ => panic!()
+    /// }
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn try_insert_mut(
+        &self,
+        key: K,
+        value: V,
+    ) -> Result<CowValueGuard<V>, OccupiedError<K, V, S, A>>
+    where
+        S: Clone,
+        V: Clone,
+    {
+        match self.entry(key) {
+            Entry::Occupied(entry) => Err(OccupiedError { entry, value }),
+            Entry::Vacant(entry) => Ok(entry.insert_mut(value)),
         }
     }
 
@@ -1870,6 +2124,45 @@ where
         }
     }
 
+    /// Removes a key from the map, returning the value at the key if the key
+    /// was previously in the map. Keeps the allocated memory for reuse.
+    ///
+    /// The key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// [`Eq`]: https://doc.rust-lang.org/std/cmp/trait.Eq.html
+    /// [`Hash`]: https://doc.rust-lang.org/std/hash/trait.Hash.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// // The map is empty
+    /// assert!(map.is_empty() && map.capacity() == 0);
+    ///
+    /// map.insert(1, "a");
+    ///
+    /// assert_eq!(map.remove(&1), Some("a"));
+    /// assert_eq!(map.remove(&1), None);
+    ///
+    /// // Now map holds none elements
+    /// assert!(map.is_empty());
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn remove_fast<Q>(&mut self, k: &Q) -> Option<Arc<V>>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        // Avoid `Option::map` because it bloats LLVM IR.
+        match self.remove_entry_fast(k) {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
+    }
+
     /// Removes a key from the map, returning the stored key and value if the
     /// key was previously in the map. Keeps the allocated memory for reuse.
     ///
@@ -1907,6 +2200,45 @@ where
             .table
             .rcu(|t| t.remove_entry(hash, equivalent_key(k)))
             .inner?;
+        Some((ret.0, ret.1.load_full()))
+    }
+
+    /// Removes a key from the map, returning the stored key and value if the
+    /// key was previously in the map. Keeps the allocated memory for reuse.
+    ///
+    /// The key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// [`Eq`]: https://doc.rust-lang.org/std/cmp/trait.Eq.html
+    /// [`Hash`]: https://doc.rust-lang.org/std/hash/trait.Hash.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// // The map is empty
+    /// assert!(map.is_empty() && map.capacity() == 0);
+    ///
+    /// map.insert(1, "a");
+    ///
+    /// assert_eq!(map.remove_entry(&1), Some((1, "a")));
+    /// assert_eq!(map.remove(&1), None);
+    ///
+    /// // Now map hold none elements
+    /// assert!(map.is_empty());
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn remove_entry_fast<Q>(&mut self, k: &Q) -> Option<(K, Arc<V>)>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let hash = make_hash::<Q, S>(&self.hash_builder, k);
+        let ret = self
+            .table
+            .rcu_fast(|t| t.remove_entry(hash, equivalent_key(k)))?;
         Some((ret.0, ret.1.load_full()))
     }
 }
@@ -3012,7 +3344,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert(self, default_key: K, default_val: V) -> (K, CowValueGuard<V>)
+    pub fn or_insert(self, default_key: K, default_val: V) -> (K, Arc<V>)
     where
         K: Hash,
         S: BuildHasher,
@@ -3020,6 +3352,35 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawEntryMut<'a, K, V, S, A> {
         match self {
             RawEntryMut::Occupied(entry) => entry.into_key_value(),
             RawEntryMut::Vacant(entry) => entry.insert(default_key, default_val),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the default if empty, and returns
+    /// mutable references to the key and value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<&str, u32> = HashMap::new();
+    ///
+    /// map.raw_entry_mut().from_key("poneyland").or_insert("poneyland", 3);
+    /// assert_eq!(map["poneyland"], 3);
+    ///
+    /// *map.raw_entry_mut().from_key("poneyland").or_insert("poneyland", 10).1 *= 2;
+    /// assert_eq!(map["poneyland"], 6);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_insert_mut(self, default_key: K, default_val: V) -> (K, CowValueGuard<V>)
+    where
+        K: Hash,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            RawEntryMut::Occupied(entry) => entry.into_key_value_mut(),
+            RawEntryMut::Vacant(entry) => entry.insert_mut(default_key, default_val),
         }
     }
 
@@ -3040,7 +3401,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawEntryMut<'a, K, V, S, A> {
     /// assert_eq!(map["poneyland"], "hoho".to_string());
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with<F>(self, default: F) -> (K, CowValueGuard<V>)
+    pub fn or_insert_with<F>(self, default: F) -> (K, Arc<V>)
     where
         F: FnOnce() -> (K, V),
         K: Hash,
@@ -3051,6 +3412,39 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawEntryMut<'a, K, V, S, A> {
             RawEntryMut::Vacant(entry) => {
                 let (k, v) = default();
                 entry.insert(k, v)
+            }
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the result of the default function if empty,
+    /// and returns mutable references to the key and value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<&str, String> = HashMap::new();
+    ///
+    /// map.raw_entry_mut().from_key("poneyland").or_insert_with(|| {
+    ///     ("poneyland", "hoho".to_string())
+    /// });
+    ///
+    /// assert_eq!(map["poneyland"], "hoho".to_string());
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_insert_with_mut<F>(self, default: F) -> (K, CowValueGuard<V>)
+    where
+        F: FnOnce() -> (K, V),
+        K: Hash,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            RawEntryMut::Occupied(entry) => entry.into_key_value_mut(),
+            RawEntryMut::Vacant(entry) => {
+                let (k, v) = default();
+                entry.insert_mut(k, v)
             }
         }
     }
@@ -3080,7 +3474,47 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawEntryMut<'a, K, V, S, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn and_modify<F>(self, f: F) -> Self
     where
+        F: FnOnce(K, Arc<V>),
+    {
+        match self {
+            RawEntryMut::Occupied(entry) => {
+                {
+                    let (k, v) = entry.get_key_value();
+                    f(k, v);
+                }
+                RawEntryMut::Occupied(entry)
+            }
+            RawEntryMut::Vacant(entry) => RawEntryMut::Vacant(entry),
+        }
+    }
+
+    /// Provides in-place mutable access to an occupied entry before any
+    /// potential inserts into the map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<&str, u32> = HashMap::new();
+    ///
+    /// map.raw_entry_mut()
+    ///    .from_key("poneyland")
+    ///    .and_modify(|_k, v| { *v += 1 })
+    ///    .or_insert("poneyland", 42);
+    /// assert_eq!(map["poneyland"], 42);
+    ///
+    /// map.raw_entry_mut()
+    ///    .from_key("poneyland")
+    ///    .and_modify(|_k, v| { *v += 1 })
+    ///    .or_insert("poneyland", 0);
+    /// assert_eq!(map["poneyland"], 43);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn and_modify_mut<F>(self, f: F) -> Self
+    where
         F: FnOnce(K, CowValueGuard<V>),
+        V: Clone,
     {
         match self {
             RawEntryMut::Occupied(entry) => {
@@ -3223,7 +3657,10 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
     /// assert_eq!(map[&"a"], 1000);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_mut(self) -> CowValueGuard<V> {
+    pub fn into_mut(self) -> CowValueGuard<V>
+    where
+        V: Clone,
+    {
         CowValueGuard::new(unsafe { &self.elem.as_mut().1 }.clone())
     }
 
@@ -3244,7 +3681,10 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
     /// assert_eq!(map[&"a"], 1000);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_mut(&self) -> CowValueGuard<V> {
+    pub fn get_mut(&self) -> CowValueGuard<V>
+    where
+        V: Clone,
+    {
         CowValueGuard::new(unsafe { &self.elem.as_mut().1 }.clone())
     }
 
@@ -3299,7 +3739,10 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
     /// assert!(Rc::strong_count(&key_one) == 1 && Rc::strong_count(&key_two) == 2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_key_value_mut(&self) -> (K, CowValueGuard<V>) {
+    pub fn get_key_value_mut(&self) -> (K, CowValueGuard<V>)
+    where
+        V: Clone,
+    {
         unsafe {
             let &(ref key, ref value) = self.elem.as_ref();
             (key.clone(), CowValueGuard::new(value.clone()))
@@ -3340,7 +3783,51 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawOccupiedEntryMut<'a, K, V, S, 
     /// assert!(Rc::strong_count(&key_one) == 1 && Rc::strong_count(&key_two) == 2);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_key_value(self) -> (K, CowValueGuard<V>) {
+    pub fn into_key_value(self) -> (K, Arc<V>) {
+        unsafe {
+            let &mut (ref mut key, ref mut value) = self.elem.as_mut();
+            (key.clone(), value.load_full())
+        }
+    }
+
+    /// Converts the OccupiedEntry into a mutable reference to the key and value in the entry
+    /// with a lifetime bound to the map itself.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
+    /// use std::rc::Rc;
+    ///
+    /// let key_one = Rc::new("a");
+    /// let key_two = Rc::new("a");
+    ///
+    /// let mut map: HashMap<Rc<&str>, u32> = HashMap::new();
+    /// map.insert(key_one.clone(), 10);
+    ///
+    /// assert_eq!(map[&key_one], 10);
+    /// assert!(Rc::strong_count(&key_one) == 2 && Rc::strong_count(&key_two) == 1);
+    ///
+    /// let inside_key: &mut Rc<&str>;
+    /// let inside_value: &mut u32;
+    /// match map.raw_entry_mut().from_key(&key_one) {
+    ///     RawEntryMut::Vacant(_) => panic!(),
+    ///     RawEntryMut::Occupied(o) => {
+    ///         let tuple = o.into_key_value();
+    ///         inside_key = tuple.0;
+    ///         inside_value = tuple.1;
+    ///     }
+    /// }
+    /// *inside_key = key_two.clone();
+    /// *inside_value = 100;
+    /// assert_eq!(map[&key_two], 100);
+    /// assert!(Rc::strong_count(&key_one) == 1 && Rc::strong_count(&key_two) == 2);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn into_key_value_mut(self) -> (K, CowValueGuard<V>)
+    where
+        V: Clone,
+    {
         unsafe {
             let &mut (ref mut key, ref mut value) = self.elem.as_mut();
             (key.clone(), CowValueGuard::new(value.clone()))
@@ -3520,13 +4007,40 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawVacantEntryMut<'a, K, V, S, A>
     /// assert_eq!(map[&"c"], 300);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, key: K, value: V) -> (K, CowValueGuard<V>)
+    pub fn insert(self, key: K, value: V) -> (K, Arc<V>)
     where
         K: Hash,
         S: BuildHasher,
     {
         let hash = make_hash::<K, S>(self.hash_builder, &key);
         self.insert_hashed_nocheck(hash, key, Arc::new(ArcSwap::new(Arc::new(value))))
+    }
+    /// Sets the value of the entry with the VacantEntry's key,
+    /// and returns a mutable reference to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
+    ///
+    /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
+    ///
+    /// match map.raw_entry_mut().from_key(&"c") {
+    ///     RawEntryMut::Occupied(_) => panic!(),
+    ///     RawEntryMut::Vacant(v) => assert_eq!(v.insert("c", 300), (&mut "c", &mut 300)),
+    /// }
+    ///
+    /// assert_eq!(map[&"c"], 300);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn insert_mut(self, key: K, value: V) -> (K, CowValueGuard<V>)
+    where
+        K: Hash,
+        S: BuildHasher,
+        V: Clone,
+    {
+        let hash = make_hash::<K, S>(self.hash_builder, &key);
+        self.insert_hashed_nocheck_mut(hash, key, Arc::new(ArcSwap::new(Arc::new(value))))
     }
 
     /// Sets the value of the entry with the VacantEntry's key,
@@ -3561,7 +4075,54 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawVacantEntryMut<'a, K, V, S, A>
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     #[allow(clippy::shadow_unrelated)]
-    pub fn insert_hashed_nocheck(
+    pub fn insert_hashed_nocheck(self, hash: u64, key: K, value: Arc<ArcSwap<V>>) -> (K, Arc<V>)
+    where
+        K: Hash,
+        S: BuildHasher,
+    {
+        self.table.rcu(|t| {
+            t.insert_entry(
+                hash,
+                (key.clone(), value.clone()),
+                make_hasher::<_, Arc<ArcSwap<V>>, S>(self.hash_builder),
+            );
+        });
+        (key, value.load_full())
+    }
+
+    /// Sets the value of the entry with the VacantEntry's key,
+    /// and returns a mutable reference to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::hash::{BuildHasher, Hash};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
+    ///
+    /// fn compute_hash<K: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &K) -> u64 {
+    ///     use core::hash::Hasher;
+    ///     let mut state = hash_builder.build_hasher();
+    ///     key.hash(&mut state);
+    ///     state.finish()
+    /// }
+    ///
+    /// let mut map: HashMap<&str, u32> = [("a", 100), ("b", 200)].into();
+    /// let key = "c";
+    /// let hash = compute_hash(map.hasher(), &key);
+    ///
+    /// match map.raw_entry_mut().from_key_hashed_nocheck(hash, &key) {
+    ///     RawEntryMut::Occupied(_) => panic!(),
+    ///     RawEntryMut::Vacant(v) => assert_eq!(
+    ///         v.insert_hashed_nocheck(hash, key, 300),
+    ///         (&mut "c", &mut 300)
+    ///     ),
+    /// }
+    ///
+    /// assert_eq!(map[&"c"], 300);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    #[allow(clippy::shadow_unrelated)]
+    pub fn insert_hashed_nocheck_mut(
         self,
         hash: u64,
         key: K,
@@ -3570,6 +4131,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawVacantEntryMut<'a, K, V, S, A>
     where
         K: Hash,
         S: BuildHasher,
+        V: Clone,
     {
         self.table.rcu(|t| {
             t.insert_entry(
@@ -3618,7 +4180,57 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawVacantEntryMut<'a, K, V, S, A>
     /// assert_eq!(map[&"a"], 100);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert_with_hasher<H>(
+    pub fn insert_with_hasher<H>(self, hash: u64, key: K, value: V, hasher: H) -> (K, Arc<V>)
+    where
+        H: Fn(&K) -> u64,
+    {
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
+        self.table
+            .rcu(|t| {
+                let r = t.insert_entry(hash, (key.clone(), value.clone()), |x| hasher(&x.0));
+                (r.0.clone(), r.1.load_full())
+            })
+            .inner
+    }
+
+    /// Set the value of an entry with a custom hasher function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::hash::{BuildHasher, Hash};
+    /// use cow_hashbrown::hash_map::{HashMap, RawEntryMut};
+    ///
+    /// fn make_hasher<K, S>(hash_builder: &S) -> impl Fn(&K) -> u64 + '_
+    /// where
+    ///     K: Hash + ?Sized,
+    ///     S: BuildHasher,
+    /// {
+    ///     move |key: &K| {
+    ///         use core::hash::Hasher;
+    ///         let mut state = hash_builder.build_hasher();
+    ///         key.hash(&mut state);
+    ///         state.finish()
+    ///     }
+    /// }
+    ///
+    /// let mut map: HashMap<&str, u32> = HashMap::new();
+    /// let key = "a";
+    /// let hash_builder = map.hasher().clone();
+    /// let hash = make_hasher(&hash_builder)(&key);
+    ///
+    /// match map.raw_entry_mut().from_hash(hash, |q| q == &key) {
+    ///     RawEntryMut::Occupied(_) => panic!(),
+    ///     RawEntryMut::Vacant(v) => assert_eq!(
+    ///         v.insert_with_hasher(hash, key, 100, make_hasher(&hash_builder)),
+    ///         (&mut "a", &mut 100)
+    ///     ),
+    /// }
+    /// map.extend([("b", 200), ("c", 300), ("d", 400), ("e", 500), ("f", 600)]);
+    /// assert_eq!(map[&"a"], 100);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn insert_with_hasher_mut<H>(
         self,
         hash: u64,
         key: K,
@@ -3627,6 +4239,7 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> RawVacantEntryMut<'a, K, V, S, A>
     ) -> (K, CowValueGuard<V>)
     where
         H: Fn(&K) -> u64,
+        V: Clone,
     {
         let value = Arc::new(ArcSwap::new(Arc::new(value)));
         self.table
@@ -4200,7 +4813,10 @@ impl<K: Clone, V, S, A: Allocator + Clone> IntoIterator for &CowHashMap<K, V, S,
     }
 }
 
-impl<K: Clone, V, S, A: Allocator + Clone> IntoIterator for &mut CowHashMap<K, V, S, A> {
+impl<K: Clone, V, S, A: Allocator + Clone> IntoIterator for &mut CowHashMap<K, V, S, A>
+where
+    V: Clone,
+{
     type Item = (K, CowValueGuard<V>);
     type IntoIter = IterMut<K, V, A>;
 
@@ -4308,6 +4924,7 @@ impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Iter<K, V, A> {}
 impl<'a, K: Clone, V, A> Iterator for IterMut<K, V, A>
 where
     A: Allocator + Clone,
+    V: Clone,
 {
     type Item = (K, CowValueGuard<V>);
 
@@ -4330,19 +4947,26 @@ where
 impl<K: Clone, V, A> ExactSizeIterator for IterMut<K, V, A>
 where
     A: Allocator + Clone,
+    V: Clone,
 {
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K: Clone, V, A> FusedIterator for IterMut<K, V, A> where A: Allocator + Clone {}
+impl<K: Clone, V, A> FusedIterator for IterMut<K, V, A>
+where
+    A: Allocator + Clone,
+    V: Clone,
+{
+}
 
 impl<K, V, A> fmt::Debug for IterMut<K, V, A>
 where
     K: fmt::Debug + Clone,
     V: fmt::Debug + Clone,
     A: Allocator + Clone,
+    V: Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
@@ -4436,7 +5060,10 @@ impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for Values<K, V, A> {
 }
 impl<K: Clone, V, A: Allocator + Clone> FusedIterator for Values<K, V, A> {}
 
-impl<K: Clone, V, A: Allocator + Clone> Iterator for ValuesMut<K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> Iterator for ValuesMut<K, V, A>
+where
+    V: Clone,
+{
     type Item = CowValueGuard<V>;
 
     #[cfg_attr(feature = "inline-more", inline)]
@@ -4452,13 +5079,16 @@ impl<K: Clone, V, A: Allocator + Clone> Iterator for ValuesMut<K, V, A> {
         self.inner.size_hint()
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for ValuesMut<K, V, A> {
+impl<K: Clone, V, A: Allocator + Clone> ExactSizeIterator for ValuesMut<K, V, A>
+where
+    V: Clone,
+{
     #[cfg_attr(feature = "inline-more", inline)]
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
-impl<K: Clone, V, A: Allocator + Clone> FusedIterator for ValuesMut<K, V, A> {}
+impl<K: Clone, V, A: Allocator + Clone> FusedIterator for ValuesMut<K, V, A> where V: Clone {}
 
 impl<K: Clone, V: Debug + Clone, A: Allocator + Clone> fmt::Debug for ValuesMut<K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -4546,14 +5176,45 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> Entry<K, V, S, A> {
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert(self, default: V) -> CowValueGuard<V>
+    pub fn or_insert(self, default: V) -> Arc<V>
     where
         K: Hash,
         S: BuildHasher,
     {
         match self {
-            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Occupied(entry) => unsafe { entry.elem.as_ref() }.1.load_full(),
             Entry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the default if empty, and returns
+    /// a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<&str, u32> = HashMap::new();
+    ///
+    /// // nonexistent key
+    /// map.entry("poneyland").or_insert(3);
+    /// assert_eq!(map["poneyland"], 3);
+    ///
+    /// // existing key
+    /// *map.entry("poneyland").or_insert(10) *= 2;
+    /// assert_eq!(map["poneyland"], 6);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_insert_mut(self, default: V) -> CowValueGuard<V>
+    where
+        K: Hash,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert_mut(default),
         }
     }
 
@@ -4576,14 +5237,45 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> Entry<K, V, S, A> {
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> CowValueGuard<V>
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> Arc<V>
     where
         K: Hash,
         S: BuildHasher,
     {
         match self {
-            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Occupied(entry) => unsafe { entry.elem.as_ref() }.1.load_full(),
             Entry::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the result of the default function if empty,
+    /// and returns a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<&str, u32> = HashMap::new();
+    ///
+    /// // nonexistent key
+    /// map.entry("poneyland").or_insert_with(|| 3);
+    /// assert_eq!(map["poneyland"], 3);
+    ///
+    /// // existing key
+    /// *map.entry("poneyland").or_insert_with(|| 10) *= 2;
+    /// assert_eq!(map["poneyland"], 6);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_insert_with_mut<F: FnOnce() -> V>(self, default: F) -> CowValueGuard<V>
+    where
+        K: Hash,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert_mut(default()),
         }
     }
 
@@ -4610,16 +5302,54 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> Entry<K, V, S, A> {
     /// assert_eq!(map["poneyland"], 18);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> CowValueGuard<V>
+    pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> Arc<V>
     where
         K: Hash,
         S: BuildHasher,
     {
         match self {
-            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Occupied(entry) => unsafe { entry.elem.as_ref() }.1.load_full(),
             Entry::Vacant(entry) => {
                 let value = default(entry.key());
                 entry.insert(value)
+            }
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting, if empty, the result of the default function.
+    /// This method allows for generating key-derived values for insertion by providing the default
+    /// function a reference to the key that was moved during the `.entry(key)` method call.
+    ///
+    /// The reference to the moved key is provided so that cloning or copying the key is
+    /// unnecessary, unlike with `.or_insert_with(|| ... )`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<&str, usize> = HashMap::new();
+    ///
+    /// // nonexistent key
+    /// map.entry("poneyland").or_insert_with_key(|key| key.chars().count());
+    /// assert_eq!(map["poneyland"], 9);
+    ///
+    /// // existing key
+    /// *map.entry("poneyland").or_insert_with_key(|key| key.chars().count() * 10) *= 2;
+    /// assert_eq!(map["poneyland"], 18);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_insert_with_key_mut<F: FnOnce(&K) -> V>(self, default: F) -> CowValueGuard<V>
+    where
+        K: Hash,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let value = default(entry.key());
+                entry.insert_mut(value)
             }
         }
     }
@@ -4774,14 +5504,46 @@ impl<'a, K: Clone, V: Default + Clone, S, A: Allocator + Clone> Entry<K, V, S, A
     /// assert_eq!(map.entry("horseland").or_default(), &mut Some(3));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_default(self) -> CowValueGuard<V>
+    pub fn or_default(self) -> Arc<V>
     where
         K: Hash,
         S: BuildHasher,
     {
         match self {
-            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Occupied(entry) => unsafe { entry.elem.as_ref() }.1.load_full(),
             Entry::Vacant(entry) => entry.insert(Default::default()),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the default value if empty,
+    /// and returns a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<&str, Option<u32>> = HashMap::new();
+    ///
+    /// // nonexistent key
+    /// map.entry("poneyland").or_default();
+    /// assert_eq!(map["poneyland"], None);
+    ///
+    /// map.insert("horseland", Some(3));
+    ///
+    /// // existing key
+    /// assert_eq!(map.entry("horseland").or_default(), &mut Some(3));
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_default_mut(self) -> CowValueGuard<V>
+    where
+        K: Hash,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert_mut(Default::default()),
         }
     }
 }
@@ -4899,7 +5661,10 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<K, V, S, A> {
     /// assert_eq!(map["poneyland"], 24);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_mut(&self) -> CowValueGuard<V> {
+    pub fn get_mut(&self) -> CowValueGuard<V>
+    where
+        V: Clone,
+    {
         let ret = unsafe { &self.elem.as_mut().1 };
         CowValueGuard::new(ret.clone())
     }
@@ -4931,7 +5696,10 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<K, V, S, A> {
     /// assert_eq!(map["poneyland"], 22);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_mut(self) -> CowValueGuard<V> {
+    pub fn into_mut(self) -> CowValueGuard<V>
+    where
+        V: Clone,
+    {
         let ret = unsafe { &self.elem.as_ref().1 };
         CowValueGuard::new(ret.clone())
     }
@@ -5029,7 +5797,52 @@ impl<'a, 'b, K: Clone, V, S, A: Allocator + Clone> OccupiedEntry<K, V, S, A> {
     ///  assert_eq!(map[&"Stringthing".to_owned()], 16);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn replace_entry(self, value: V) -> (K, CowValueGuard<V>) {
+    pub fn replace_entry(self, value: V) -> (K, Arc<V>) {
+        let entry = unsafe { self.elem.as_mut() };
+
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
+        let old_key = mem::replace(&mut entry.0, self.key.unwrap());
+        let old_value = mem::replace(&mut entry.1, value);
+
+        (old_key, old_value.load_full())
+    }
+
+    /// Replaces the entry, returning the old key and value. The new key in the hash map will be
+    /// the key used to create this entry.
+    ///
+    /// # Panics
+    ///
+    /// Will panic if this OccupiedEntry was created through [`Entry::insert`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    ///  use cow_hashbrown::hash_map::{Entry, HashMap};
+    ///  use std::rc::Rc;
+    ///
+    ///  let mut map: HashMap<Rc<String>, u32> = HashMap::new();
+    ///  let key_one = Rc::new("Stringthing".to_string());
+    ///  let key_two = Rc::new("Stringthing".to_string());
+    ///
+    ///  map.insert(key_one.clone(), 15);
+    ///  assert!(Rc::strong_count(&key_one) == 2 && Rc::strong_count(&key_two) == 1);
+    ///
+    ///  match map.entry(key_two.clone()) {
+    ///      Entry::Occupied(entry) => {
+    ///          let (old_key, old_value): (Rc<String>, u32) = entry.replace_entry(16);
+    ///          assert!(Rc::ptr_eq(&key_one, &old_key) && old_value == 15);
+    ///      }
+    ///      Entry::Vacant(_) => panic!(),
+    ///  }
+    ///
+    ///  assert!(Rc::strong_count(&key_one) == 1 && Rc::strong_count(&key_two) == 2);
+    ///  assert_eq!(map[&"Stringthing".to_owned()], 16);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn replace_entry_mut(self, value: V) -> (K, CowValueGuard<V>)
+    where
+        V: Clone,
+    {
         let entry = unsafe { self.elem.as_mut() };
 
         let value = Arc::new(ArcSwap::new(Arc::new(value)));
@@ -5227,10 +6040,47 @@ impl<'a, K: Clone, V, S, A: Allocator + Clone> VacantEntry<K, V, S, A> {
     /// assert_eq!(map["poneyland"], 37);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, value: V) -> CowValueGuard<V>
+    pub fn insert(self, value: V) -> Arc<V>
     where
         K: Hash,
         S: BuildHasher,
+    {
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
+        self.table
+            .table
+            .rcu(|t| {
+                let r = t.insert_entry(
+                    self.hash,
+                    (self.key.clone(), value.clone()),
+                    make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
+                );
+                r.1.load_full()
+            })
+            .inner
+    }
+
+    /// Sets the value of the entry with the VacantEntry's key,
+    /// and returns a mutable reference to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::Entry;
+    ///
+    /// let mut map: HashMap<&str, u32> = HashMap::new();
+    ///
+    /// if let Entry::Vacant(o) = map.entry("poneyland") {
+    ///     o.insert(37);
+    /// }
+    /// assert_eq!(map["poneyland"], 37);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn insert_mut(self, value: V) -> CowValueGuard<V>
+    where
+        K: Hash,
+        S: BuildHasher,
+        V: Clone,
     {
         let value = Arc::new(ArcSwap::new(Arc::new(value)));
         self.table
@@ -5316,14 +6166,45 @@ impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone> EntryRef<'a, 'b, K
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert(self, default: V) -> CowValueGuard<V>
+    pub fn or_insert(self, default: V) -> Arc<V>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
     {
         match self {
-            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Occupied(entry) => unsafe { entry.elem.as_ref() }.1.load_full(),
             EntryRef::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the default if empty, and returns
+    /// a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<String, u32> = HashMap::new();
+    ///
+    /// // nonexistent key
+    /// map.entry_ref("poneyland").or_insert(3);
+    /// assert_eq!(map["poneyland"], 3);
+    ///
+    /// // existing key
+    /// *map.entry_ref("poneyland").or_insert(10) *= 2;
+    /// assert_eq!(map["poneyland"], 6);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_insert_mut(self, default: V) -> CowValueGuard<V>
+    where
+        K: Hash + From<&'b Q>,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Vacant(entry) => entry.insert_mut(default),
         }
     }
 
@@ -5346,14 +6227,45 @@ impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone> EntryRef<'a, 'b, K
     /// assert_eq!(map["poneyland"], 6);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> CowValueGuard<V>
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> Arc<V>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
     {
         match self {
-            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Occupied(entry) => unsafe { entry.elem.as_ref() }.1.load_full(),
             EntryRef::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the result of the default function if empty,
+    /// and returns a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<String, u32> = HashMap::new();
+    ///
+    /// // nonexistent key
+    /// map.entry_ref("poneyland").or_insert_with(|| 3);
+    /// assert_eq!(map["poneyland"], 3);
+    ///
+    /// // existing key
+    /// *map.entry_ref("poneyland").or_insert_with(|| 10) *= 2;
+    /// assert_eq!(map["poneyland"], 6);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_insert_with_mut<F: FnOnce() -> V>(self, default: F) -> CowValueGuard<V>
+    where
+        K: Hash + From<&'b Q>,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Vacant(entry) => entry.insert_mut(default()),
         }
     }
 
@@ -5377,16 +6289,51 @@ impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone> EntryRef<'a, 'b, K
     /// assert_eq!(map["poneyland"], 18);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_insert_with_key<F: FnOnce(&Q) -> V>(self, default: F) -> CowValueGuard<V>
+    pub fn or_insert_with_key<F: FnOnce(&Q) -> V>(self, default: F) -> Arc<V>
     where
         K: Hash + Borrow<Q> + From<&'b Q>,
         S: BuildHasher,
     {
         match self {
-            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Occupied(entry) => unsafe { entry.elem.as_ref() }.1.load_full(),
             EntryRef::Vacant(entry) => {
                 let value = default(entry.key.as_ref());
                 entry.insert(value)
+            }
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting, if empty, the result of the default function.
+    /// This method allows for generating key-derived values for insertion by providing the default
+    /// function an access to the borrower form of the key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<String, usize> = HashMap::new();
+    ///
+    /// // nonexistent key
+    /// map.entry_ref("poneyland").or_insert_with_key(|key| key.chars().count());
+    /// assert_eq!(map["poneyland"], 9);
+    ///
+    /// // existing key
+    /// *map.entry_ref("poneyland").or_insert_with_key(|key| key.chars().count() * 10) *= 2;
+    /// assert_eq!(map["poneyland"], 18);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_insert_with_key_mut<F: FnOnce(&Q) -> V>(self, default: F) -> CowValueGuard<V>
+    where
+        K: Hash + Borrow<Q> + From<&'b Q>,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Vacant(entry) => {
+                let value = default(entry.key.as_ref());
+                entry.insert_mut(value)
             }
         }
     }
@@ -5546,14 +6493,46 @@ impl<'a, 'b, K: Clone, Q: ?Sized, V: Default + Clone, S, A: Allocator + Clone>
     /// assert_eq!(map.entry_ref("horseland").or_default(), &mut Some(3));
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn or_default(self) -> CowValueGuard<V>
+    pub fn or_default(self) -> Arc<V>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
     {
         match self {
-            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Occupied(entry) => unsafe { entry.elem.as_ref() }.1.load_full(),
             EntryRef::Vacant(entry) => entry.insert(Default::default()),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the default value if empty,
+    /// and returns a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    ///
+    /// let mut map: HashMap<String, Option<u32>> = HashMap::new();
+    ///
+    /// // nonexistent key
+    /// map.entry_ref("poneyland").or_default();
+    /// assert_eq!(map["poneyland"], None);
+    ///
+    /// map.insert("horseland".to_string(), Some(3));
+    ///
+    /// // existing key
+    /// assert_eq!(map.entry_ref("horseland").or_default(), &mut Some(3));
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn or_default_mut(self) -> CowValueGuard<V>
+    where
+        K: Hash + From<&'b Q>,
+        S: BuildHasher,
+        V: Clone,
+    {
+        match self {
+            EntryRef::Occupied(entry) => entry.into_mut(),
+            EntryRef::Vacant(entry) => entry.insert_mut(Default::default()),
         }
     }
 }
@@ -5670,7 +6649,10 @@ impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
     /// assert_eq!(map["poneyland"], 24);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get_mut(&self) -> CowValueGuard<V> {
+    pub fn get_mut(&self) -> CowValueGuard<V>
+    where
+        V: Clone,
+    {
         let ret = unsafe { &self.elem.as_ref().1 };
         CowValueGuard::new(ret.clone())
     }
@@ -5700,7 +6682,10 @@ impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
     /// assert_eq!(map["poneyland"], 22);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_mut(self) -> CowValueGuard<V> {
+    pub fn into_mut(self) -> CowValueGuard<V>
+    where
+        V: Clone,
+    {
         let ret = unsafe { &self.elem.as_ref().1 };
         CowValueGuard::new(ret.clone())
     }
@@ -5724,15 +6709,7 @@ impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn insert(&self, value: V) -> Arc<V> {
-        unsafe {
-            let mut ret = self.elem.inner.as_ref().1.load_full();
-            let value = Arc::new(value);
-            self.elem.as_ref().1.rcu(|v| {
-                ret = v.clone();
-                value.clone()
-            });
-            ret
-        }
+        unsafe { self.elem.inner.as_ref().1.swap(Arc::new(value)) }
     }
 
     /// Takes the value out of the entry, and returns it.
@@ -6010,10 +6987,49 @@ impl<'a, 'b, K: Clone, Q: ?Sized, V, S, A: Allocator + Clone>
     /// assert_eq!(map["poneyland"], 37);
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn insert(self, value: V) -> CowValueGuard<V>
+    pub fn insert(self, value: V) -> Arc<V>
     where
         K: Hash + From<&'b Q>,
         S: BuildHasher,
+    {
+        let table = &self.table.table;
+        let key = self.key.into_owned();
+        let value = Arc::new(ArcSwap::new(Arc::new(value)));
+        table
+            .rcu(|t| {
+                let r = t.insert_entry(
+                    self.hash,
+                    (key.clone(), value.clone()),
+                    make_hasher::<_, Arc<ArcSwap<V>>, S>(&self.table.hash_builder),
+                );
+                r.1.load_full()
+            })
+            .inner
+    }
+
+    /// Sets the value of the entry with the VacantEntryRef's key,
+    /// and returns a mutable reference to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cow_hashbrown::CowHashMap as HashMap;
+    /// use cow_hashbrown::hash_map::EntryRef;
+    ///
+    /// let mut map: HashMap<String, u32> = HashMap::new();
+    /// let key: &str = "poneyland";
+    ///
+    /// if let EntryRef::Vacant(o) = map.entry_ref(key) {
+    ///     o.insert(37);
+    /// }
+    /// assert_eq!(map["poneyland"], 37);
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn insert_mut(self, value: V) -> CowValueGuard<V>
+    where
+        K: Hash + From<&'b Q>,
+        S: BuildHasher,
+        V: Clone,
     {
         let table = &self.table.table;
         let key = self.key.into_owned();
@@ -6629,7 +7645,7 @@ mod test_map {
     #[test]
     #[cfg_attr(miri, ignore)] // FIXME: takes too long
     fn test_lots_of_insertions() {
-        let m = CowHashMap::new();
+        let mut m = CowHashMap::new();
 
         // Try this a few times to make sure we never screw up the hashmap's
         // internal state.
@@ -6657,7 +7673,7 @@ mod test_map {
 
             // remove forwards
             for i in 1..1001 {
-                assert!(m.remove(&i).is_some());
+                assert!(m.remove_fast(&i).is_some());
 
                 for j in 1..=i {
                     assert!(!m.contains_key(&j));
@@ -6673,12 +7689,12 @@ mod test_map {
             }
 
             for i in 1..1001 {
-                assert!(m.insert(i, i).is_none());
+                assert!(m.insert_fast(i, i).is_none());
             }
 
             // remove backwards
             for i in (1..1001).rev() {
-                assert!(m.remove(&i).is_some());
+                assert!(m.remove_fast(&i).is_some());
 
                 for j in i..1001 {
                     assert!(!m.contains_key(&j));
