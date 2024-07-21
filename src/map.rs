@@ -278,6 +278,19 @@ impl<V: Clone> CowValueGuard<V> {
             inner,
         }
     }
+
+    /// Freezes the copy on write guard and returns a reference to it
+    pub fn freeze(mut self) -> Arc<V> {
+        match &mut self.mode {
+            CowValueGuardMode::Read(inner) => inner.clone(),
+            CowValueGuardMode::Write(inner) => {
+                if let Some(inner) = inner.take() {
+                    self.inner.store(Arc::new(inner));
+                }
+                self.inner.load_full()
+            },
+        }
+    }    
 }
 
 impl<V: Clone> PartialEq<V> for CowValueGuard<V>
