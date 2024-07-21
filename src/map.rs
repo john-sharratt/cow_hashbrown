@@ -280,7 +280,7 @@ impl<V: Clone> CowValueGuard<V> {
     }
 
     /// Freezes the copy on write guard and returns a reference to it
-    pub fn freeze(mut self) -> Arc<V> {
+    pub fn freeze(&mut self) -> Arc<V> {
         match &mut self.mode {
             CowValueGuardMode::Read(inner) => inner.clone(),
             CowValueGuardMode::Write(inner) => {
