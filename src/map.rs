@@ -287,7 +287,9 @@ impl<V: Clone> CowValueGuard<V> {
                 if let Some(inner) = inner.take() {
                     self.inner.store(Arc::new(inner));
                 }
-                self.inner.load_full()
+                let ret = self.inner.load_full();
+                self.mode = CowValueGuardMode::Read(ret.clone());
+                ret
             },
         }
     }    
