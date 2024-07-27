@@ -805,7 +805,7 @@ impl<T> CowRawTable<T, Global> {
     }
 }
 
-pub(crate) struct RawTableGuard<T, A: Allocator + Clone, R> {
+pub struct RawTableGuard<T, A: Allocator + Clone, R> {
     pub(crate) guard: Arc<RawTable<T, A>>,
     pub(crate) inner: R,
 }
