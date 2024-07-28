@@ -290,9 +290,9 @@ impl<V: Clone> CowValueGuard<V> {
                 let ret = self.inner.load_full();
                 self.mode = CowValueGuardMode::Read(ret.clone());
                 ret
-            },
+            }
         }
-    }    
+    }
 }
 
 impl<V: Clone> PartialEq<V> for CowValueGuard<V>
@@ -381,6 +381,18 @@ impl<V: Clone> DerefMut for CowValueGuard<V> {
             CowValueGuardMode::Read(_) => unreachable!(),
             CowValueGuardMode::Write(inner) => inner.as_mut().unwrap(),
         }
+    }
+}
+
+impl<V: Clone> AsRef<V> for CowValueGuard<V> {
+    fn as_ref(&self) -> &V {
+        self.deref()
+    }
+}
+
+impl<V: Clone> AsMut<V> for CowValueGuard<V> {
+    fn as_mut(&mut self) -> &mut V {
+        self.deref_mut()
     }
 }
 
